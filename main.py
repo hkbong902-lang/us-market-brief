@@ -285,10 +285,10 @@ def collect_market_data():
             mcap = yf.Ticker(t).fast_info.get("marketCap")
         except Exception:
             mcap = None
+        # 개별 종목의 종가는 브리핑에 쓰지 않으므로 아예 싣지 않는다.
         megacaps.append({
             "ticker": t,
             "name": TICKER_NAMES.get(t, t),
-            "close": round(float(s.iloc[-1]), 2),
             "chg_pct_d": round(pct(float(s.iloc[-1]), float(s.iloc[-2])), 2),
             "market_cap": mcap,
         })
@@ -308,7 +308,6 @@ def collect_market_data():
             "ticker": t,
             "name": TICKER_NAMES.get(t, t),
             "group": TICKER_GROUP.get(t, "기타"),
-            "close": round(float(s.iloc[-1]), 2),
             "chg_pct_d": round(pct(float(s.iloc[-1]), float(s.iloc[-2])), 2),
         })
     movers.sort(key=lambda x: x["chg_pct_d"], reverse=True)
@@ -353,6 +352,8 @@ SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데스�
 규칙:
 - 반드시 한국어. 텔레그램 발송용이므로 마크다운 표 대신 줄단위 텍스트/이모지 사용.
 - HTML 태그는 <b>, <i>만 사용 가능(텔레그램 HTML 모드). 다른 태그 금지.
+- 개별 종목은 <b>회사명(티커)</b> 등락률 만 표기한다. 종목의 주가(종가·달러 금액)는
+  브리핑 어디에도 쓰지 말 것. 지수·금리·유가·달러인덱스·VIX의 수치는 ②에 그대로 표기한다.
 - 구성: ①오늘의 서사(그날 시장을 움직인 힘을 4~6문장의 이야기로: 금리 방향과 그 이유,
   지수 간 breadth의 의미 — 예: 소형주와 대형주의 엇갈림을 어떻게 읽어야 하는지, 유가·달러인덱스·
   VIX 등 핵심 변수의 흐름과 함의(달러 강세/약세가 위험자산과 원자재에 주는 압력, VIX 수준이
@@ -365,7 +366,7 @@ SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데스�
     매일 똑같은 형식으로 반복할 것. 각 블록은 예외 없이 다음 (a)(b)(c) 3단으로 구성한다:
       (a) 섹터 헤더 한 줄 — <b>섹터/테마명</b> 평균 등락률, 상승·하락 종목 수
       (b) 그 섹터 안의 종목을 등락률 순으로 최소 4개 —
-          <b>회사명(티커)</b> 등락률 · 종가 형식으로 한 줄씩
+          <b>회사명(티커)</b> 등락률 형식으로 한 줄씩
       (c) 서사 3~5문장 — 이 섹터가 왜 그렇게 움직였는지. 종목별 촉매(실적, 수주,
           가이던스, 애널리스트 코멘트, 수급, 매크로)를 하나의 흐름으로 엮을 것.
           종목 나열의 반복으로 끝내지 말 것.
@@ -479,7 +480,7 @@ def build_fallback_brief(data):
     L.append("<b>③ 나스닥 시총 상위 10</b>")
     for i, m in enumerate(data["nasdaq_top10_by_mcap"], 1):
         cap = f"${m['market_cap']/1e12:.2f}T" if m["market_cap"] >= 1e12 else f"${m['market_cap']/1e9:.0f}B"
-        L.append(f"{i}. {m['ticker']}: {m['close']:,.2f} ({m['chg_pct_d']:+.2f}%, {cap})")
+        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%  <i>{cap}</i>")
     L.append("")
     if data.get("watchlist_group_performance"):
         L.append("<b>테마별 평균 등락(워치리스트)</b>")
@@ -488,11 +489,11 @@ def build_fallback_brief(data):
         L.append("")
     L.append("<b>④ 워치리스트 급등 Top 10</b> <i>(대형주 워치리스트 기준)</i>")
     for i, m in enumerate(data["watchlist_top_gainers"], 1):
-        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['close']:,.2f} ({m['chg_pct_d']:+.2f}%)")
+        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%")
     L.append("")
     L.append("<b>급락 Top 10</b>")
     for i, m in enumerate(data["watchlist_top_losers"], 1):
-        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['close']:,.2f} ({m['chg_pct_d']:+.2f}%)")
+        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%")
     L.append("")
     L.append("<i>본 내용은 투자 권유가 아닌 정보 제공 목적입니다.</i>")
     return "\n".join(L)
