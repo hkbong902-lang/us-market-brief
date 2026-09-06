@@ -57,25 +57,143 @@ NASDAQ_MEGACAP_CANDIDATES = [
     "AMD", "ASML", "NFLX", "COST", "PLTR", "CSCO", "PEP", "QCOM", "ADBE",
 ]
 
-# 급등락 스캔용 대형주 워치리스트 — 필요시 자유롭게 수정
-MOVER_WATCHLIST = [
-    # 메가캡/반도체
-    "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "AMD",
-    "ASML", "MU", "TSM", "INTC", "QCOM", "ARM", "LRCX", "AMAT", "KLAC", "TXN",
-    # 메모리·스토리지·AI 인프라
-    "SNDK", "SKHY", "WDC", "STX", "MRVL", "NVTS", "SMCI", "DELL",
-    "VRT", "BE", "LITE", "COHR", "ANET", "CRDO",
-    # 소프트웨어/인터넷
-    "PLTR", "CRM", "ORCL", "NOW", "SNOW", "NFLX", "SHOP", "UBER", "PANW", "CRWD",
-    "ADBE", "TEAM", "MDB", "RBLX", "FICO", "EFX", "GWRE", "AMC", "ZS", "DOCU", "MP",
-    # 금융
-    "JPM", "BAC", "GS", "MS", "WFC", "BLK", "BRK-B", "V", "MA", "COIN",
-    # 에너지
-    "XOM", "CVX", "COP", "SLB", "MPC", "VLO", "OXY", "EOG", "HAL", "PSX",
-    # 헬스케어/소비/산업
-    "LLY", "UNH", "JNJ", "PFE", "MRK", "ABBV", "WMT", "COST", "HD", "NKE",
-    "LULU", "MCD", "SBUX", "DIS", "BA", "CAT", "GE", "LMT", "DE", "HON",
-]
+# 급등락 스캔용 워치리스트 — 테마별로 묶어 '진앙지 → 확산 → 반대편' 서사에 쓴다.
+# 티커를 추가할 때는 TICKER_NAMES에 회사명도 함께 넣어야 브리핑에 종목명이 정확히 나온다.
+MOVER_WATCHLIST_GROUPS = {
+    "반도체·반도체장비": [
+        "NVDA", "AVGO", "AMD", "ASML", "MU", "TSM", "INTC", "QCOM", "ARM", "LRCX", "AMAT",
+        "KLAC", "TXN"
+    ],
+    "메가캡 플랫폼": [
+        "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"
+    ],
+    "AI 인프라·메모리·스토리지·하드웨어": [
+        "SNDK", "SKHY", "WDC", "STX", "MRVL", "NVTS", "SMCI", "DELL", "VRT", "BE", "LITE",
+        "COHR", "ANET", "CRDO"
+    ],
+    "소프트웨어·SaaS·인터넷": [
+        "PLTR", "CRM", "ORCL", "NOW", "SNOW", "NFLX", "SHOP", "UBER", "PANW", "CRWD", "ADBE",
+        "TEAM", "MDB", "RBLX", "FICO", "EFX", "GWRE", "ZS", "DOCU"
+    ],
+    "금융": [
+        "JPM", "BAC", "GS", "MS", "WFC", "BLK", "BRK-B", "V", "MA", "COIN"
+    ],
+    "에너지": [
+        "XOM", "CVX", "COP", "SLB", "MPC", "VLO", "OXY", "EOG", "HAL", "PSX"
+    ],
+    "헬스케어·소비·산업": [
+        "LLY", "UNH", "JNJ", "PFE", "MRK", "ABBV", "WMT", "COST", "HD", "NKE", "LULU", "MCD",
+        "SBUX", "DIS", "BA", "CAT", "GE", "LMT", "DE", "HON"
+    ],
+    "기타(원자재·밈주)": [
+        "MP", "AMC"
+    ],
+}
+
+MOVER_WATCHLIST = [t for ts in MOVER_WATCHLIST_GROUPS.values() for t in ts]
+TICKER_GROUP = {t: g for g, ts in MOVER_WATCHLIST_GROUPS.items() for t in ts}
+
+# 브리핑에 종목명을 정확히 표기하기 위한 매핑(yfinance longName 기준).
+# 없는 티커는 티커 문자열이 그대로 쓰인다.
+TICKER_NAMES = {
+    "AAPL": "Apple Inc.",
+    "ABBV": "AbbVie Inc.",
+    "ADBE": "Adobe Inc.",
+    "AMAT": "Applied Materials, Inc.",
+    "AMC": "AMC Entertainment Holdings, Inc.",
+    "AMD": "Advanced Micro Devices, Inc.",
+    "AMZN": "Amazon.com, Inc.",
+    "ANET": "Arista Networks, Inc.",
+    "ARM": "Arm Holdings plc",
+    "ASML": "ASML Holding N.V.",
+    "AVGO": "Broadcom Inc.",
+    "BA": "The Boeing Company",
+    "BAC": "Bank of America Corporation",
+    "BE": "Bloom Energy Corporation",
+    "BLK": "BlackRock, Inc.",
+    "BRK-B": "Berkshire Hathaway Inc.",
+    "CAT": "Caterpillar Inc.",
+    "COHR": "Coherent Corp.",
+    "COIN": "Coinbase Global, Inc.",
+    "COP": "ConocoPhillips",
+    "COST": "Costco Wholesale Corporation",
+    "CRDO": "Credo Technology Group Holding Ltd",
+    "CRM": "Salesforce, Inc.",
+    "CRWD": "CrowdStrike Holdings, Inc.",
+    "CSCO": "Cisco Systems, Inc.",
+    "CVX": "Chevron Corporation",
+    "DE": "Deere & Company",
+    "DELL": "Dell Technologies Inc.",
+    "DIS": "The Walt Disney Company",
+    "DOCU": "DocuSign, Inc.",
+    "EFX": "Equifax Inc.",
+    "EOG": "EOG Resources, Inc.",
+    "FICO": "Fair Isaac Corporation",
+    "GE": "GE Aerospace",
+    "GOOGL": "Alphabet Inc.",
+    "GS": "The Goldman Sachs Group, Inc.",
+    "GWRE": "Guidewire Software, Inc.",
+    "HAL": "Halliburton Company",
+    "HD": "The Home Depot, Inc.",
+    "HON": "Honeywell International Inc.",
+    "INTC": "Intel Corporation",
+    "JNJ": "Johnson & Johnson",
+    "JPM": "JPMorgan Chase & Co.",
+    "KLAC": "KLA Corporation",
+    "LITE": "Lumentum Holdings Inc.",
+    "LLY": "Eli Lilly and Company",
+    "LMT": "Lockheed Martin Corporation",
+    "LRCX": "Lam Research Corporation",
+    "LULU": "lululemon athletica inc.",
+    "MA": "Mastercard Incorporated",
+    "MCD": "McDonald's Corporation",
+    "MDB": "MongoDB, Inc.",
+    "META": "Meta Platforms, Inc.",
+    "MP": "MP Materials Corp.",
+    "MPC": "Marathon Petroleum Corporation",
+    "MRK": "Merck & Co., Inc.",
+    "MRVL": "Marvell Technology, Inc.",
+    "MS": "Morgan Stanley",
+    "MSFT": "Microsoft Corporation",
+    "MU": "Micron Technology, Inc.",
+    "NFLX": "Netflix, Inc.",
+    "NKE": "NIKE, Inc.",
+    "NOW": "ServiceNow, Inc.",
+    "NVDA": "NVIDIA Corporation",
+    "NVTS": "Navitas Semiconductor Corporation",
+    "ORCL": "Oracle Corporation",
+    "OXY": "Occidental Petroleum Corporation",
+    "PANW": "Palo Alto Networks, Inc.",
+    "PEP": "PepsiCo, Inc.",
+    "PFE": "Pfizer Inc.",
+    "PLTR": "Palantir Technologies Inc.",
+    "PSX": "Phillips 66",
+    "QCOM": "QUALCOMM Incorporated",
+    "RBLX": "Roblox Corporation",
+    "SBUX": "Starbucks Corporation",
+    "SHOP": "Shopify Inc.",
+    "SKHY": "SK hynix Inc.",
+    "SLB": "SLB N.V.",
+    "SMCI": "Super Micro Computer, Inc.",
+    "SNDK": "Sandisk Corporation",
+    "SNOW": "Snowflake Inc.",
+    "STX": "Seagate Technology Holdings plc",
+    "TEAM": "Atlassian Corporation",
+    "TSLA": "Tesla, Inc.",
+    "TSM": "Taiwan Semiconductor Manufacturing Company Limited",
+    "TXN": "Texas Instruments Incorporated",
+    "UBER": "Uber Technologies, Inc.",
+    "UNH": "UnitedHealth Group Incorporated",
+    "V": "Visa Inc.",
+    "VLO": "Valero Energy Corporation",
+    "VRT": "Vertiv Holdings Co",
+    "WDC": "Western Digital Corporation",
+    "WFC": "Wells Fargo & Company",
+    "WMT": "Walmart Inc.",
+    "XOM": "ExxonMobil Holdings Corporation",
+    "ZS": "Zscaler, Inc.",
+}
+
 
 TELEGRAM_MAX = 4096
 
@@ -169,6 +287,7 @@ def collect_market_data():
             mcap = None
         megacaps.append({
             "ticker": t,
+            "name": TICKER_NAMES.get(t, t),
             "close": round(float(s.iloc[-1]), 2),
             "chg_pct_d": round(pct(float(s.iloc[-1]), float(s.iloc[-2])), 2),
             "market_cap": mcap,
@@ -177,7 +296,9 @@ def collect_market_data():
     megacaps.sort(key=lambda x: x["market_cap"], reverse=True)
     megacaps = megacaps[:10]
 
-    # 4) 워치리스트 급등락 스캔
+    # 4) 워치리스트 급등락 스캔 — 전 종목을 그대로 실어 보낸다.
+    #    상위/하위 몇 개만 보내면 "반도체가 오른 날 하락한 SaaS" 같은 로테이션 서사를 쓸
+    #    근거가 모델에 도달하지 않는다. 테마 반대편이면 하락폭이 작아도 중요한 종목이다.
     wl = download_closes(sorted(set(MOVER_WATCHLIST)), period="10d")
     movers = []
     for t, s in wl.items():
@@ -185,11 +306,27 @@ def collect_market_data():
             continue
         movers.append({
             "ticker": t,
+            "name": TICKER_NAMES.get(t, t),
+            "group": TICKER_GROUP.get(t, "기타"),
             "close": round(float(s.iloc[-1]), 2),
             "chg_pct_d": round(pct(float(s.iloc[-1]), float(s.iloc[-2])), 2),
         })
-    gainers = sorted(movers, key=lambda x: x["chg_pct_d"], reverse=True)[:10]
-    losers = sorted(movers, key=lambda x: x["chg_pct_d"])[:5]
+    movers.sort(key=lambda x: x["chg_pct_d"], reverse=True)
+    gainers = movers[:10]
+    losers = list(reversed(movers[-10:]))
+
+    # 그룹별 평균 등락률 — 그날 자금이 어느 테마에서 어느 테마로 돌았는지 드러낸다.
+    group_perf = []
+    for g in MOVER_WATCHLIST_GROUPS:
+        vals = [m["chg_pct_d"] for m in movers if m["group"] == g]
+        if vals:
+            group_perf.append({
+                "group": g,
+                "avg_chg_pct_d": round(sum(vals) / len(vals), 2),
+                "up": sum(1 for v in vals if v > 0),
+                "down": sum(1 for v in vals if v < 0),
+            })
+    group_perf.sort(key=lambda x: x["avg_chg_pct_d"], reverse=True)
 
     return {
         "session_date": str(t_date),
@@ -197,9 +334,14 @@ def collect_market_data():
         "indicators": indicators,
         "sectors_by_daily_change": sectors,
         "nasdaq_top10_by_mcap": megacaps,
+        "watchlist_group_performance": group_perf,
         "watchlist_top_gainers": gainers,
         "watchlist_top_losers": losers,
-        "note": "gainers/losers는 대형주 워치리스트 기준(시장 전체 아님)",
+        "watchlist_all": movers,
+        "note": ("watchlist_all이 워치리스트 전 종목의 등락률·소속 그룹이다(등락률 내림차순). "
+                 "top_gainers/top_losers는 그 중 상·하위 10개를 뽑아둔 편의용 목록일 뿐이며, "
+                 "서사를 쓸 때는 반드시 watchlist_all 전체를 보고 판단할 것. "
+                 "모두 대형주 워치리스트 기준이라 시장 전체 순위와는 다르다."),
     }
 
 
@@ -223,8 +365,18 @@ SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데스�
         불을 붙인 촉매(실적, 수주, 애널리스트 코멘트, 수급)를 이야기로 연결
     (2) 확산: 같은 테마의 밸류체인으로 번진 종목들(예: 반도체 랠리 시 전력·냉각·광통신·
         스토리지 등)을 상승 논리와 함께 언급
-    (3) 반대편: 그 랠리로 자금이 빠져나간 피해 섹터·종목들을 하락 논리(로테이션, 금리,
-        침식 서사)와 함께 서술하고, 피해 진영 안에서 역주행한 예외 종목이 있으면 그 이유를 명시
+    (3) 반대편 — 이 소항목을 절대 생략하거나 한두 줄로 줄이지 말 것.
+        그 랠리로 자금이 빠져나간 피해 섹터·종목들을 하락 논리(로테이션, 멀티플 압축, 금리,
+        AI가 기존 소프트웨어의 해자를 잠식한다는 침식 서사 등)와 함께 서술한다.
+        ★필수: watchlist_all(워치리스트 전 종목의 등락률·소속 그룹)과
+        watchlist_group_performance(그룹별 평균)를 보고, 주도 테마의 반대편 그룹에서 하락한
+        종목을 최소 4개 이상 고른 뒤 각각 <b>종목명(티커)</b> 등락률·종가를 명시할 것.
+        예: 반도체·AI 인프라가 오른 날이면 '소프트웨어·SaaS·인터넷' 그룹의 하락 종목들이
+        반대편이다. watchlist_top_losers 목록에 없더라도, 테마 반대편이면 하락폭이 작아도
+        반드시 포함한다(하락폭 상위 5개만 훑는 것은 이 섹션의 실패다).
+        고른 종목들을 개별 나열로 끝내지 말고, 왜 같은 날 같은 방향으로 팔렸는지를
+        하나의 자금 이동 서사로 엮을 것.
+        피해 진영 안에서 역주행한 예외 종목이 있으면 그 이유를 명시
     (4) 메가캡의 그늘과 개별 드라마: 시총 상위 종목 중 크게 움직인 종목들의 개별 스토리
         (경영진 교체, 신제품 실망, 실적 등)를 반드시 포함하고, 이에 더해 섹터 흐름과 무관하게
         자기만의 이유(규제 이슈, 실적 가이던스 쇼크, M&A, 밈주 수급 등)로 급등락한 특징
@@ -316,11 +468,18 @@ def build_fallback_brief(data):
         cap = f"${m['market_cap']/1e12:.2f}T" if m["market_cap"] >= 1e12 else f"${m['market_cap']/1e9:.0f}B"
         L.append(f"{i}. {m['ticker']}: {m['close']:,.2f} ({m['chg_pct_d']:+.2f}%, {cap})")
     L.append("")
+    if data.get("watchlist_group_performance"):
+        L.append("<b>테마별 평균 등락(워치리스트)</b>")
+        for g in data["watchlist_group_performance"]:
+            L.append(f"· {g['group']}: {g['avg_chg_pct_d']:+.2f}% (상승 {g['up']} / 하락 {g['down']})")
+        L.append("")
     L.append("<b>④ 워치리스트 급등 Top 10</b> <i>(대형주 워치리스트 기준)</i>")
     for i, m in enumerate(data["watchlist_top_gainers"], 1):
-        L.append(f"{i}. {m['ticker']}: {m['close']:,.2f} ({m['chg_pct_d']:+.2f}%)")
+        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['close']:,.2f} ({m['chg_pct_d']:+.2f}%)")
     L.append("")
-    L.append("급락 참고: " + ", ".join(f"{m['ticker']} {m['chg_pct_d']:+.2f}%" for m in data["watchlist_top_losers"]))
+    L.append("<b>급락 Top 10</b>")
+    for i, m in enumerate(data["watchlist_top_losers"], 1):
+        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['close']:,.2f} ({m['chg_pct_d']:+.2f}%)")
     L.append("")
     L.append("<i>본 내용은 투자 권유가 아닌 정보 제공 목적입니다.</i>")
     return "\n".join(L)

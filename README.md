@@ -84,7 +84,11 @@ Actions → **US Market Daily Brief** → **Run workflow** 를 누르면 나오�
 아직 갱신되지 않아 정상 거래일에도 "휴장" 안내가 갈 수 있으니 여유를 두세요.
 
 **Q. 급등락 스캔 종목을 바꾸고 싶어요.**
-`main.py` 상단의 `MOVER_WATCHLIST`, `NASDAQ_MEGACAP_CANDIDATES` 리스트를 수정하면 됩니다.
+`main.py` 상단의 `MOVER_WATCHLIST_GROUPS`(테마별 묶음), `NASDAQ_MEGACAP_CANDIDATES`를
+수정하면 됩니다. 티커를 추가할 때는 `TICKER_NAMES`에 회사명도 함께 넣으세요
+(없으면 브리핑에 티커만 표기됩니다).
+그룹 이름은 브리핑의 "진앙지 → 확산 → 반대편" 서사에 그대로 쓰이므로,
+같은 테마끼리 묶여 있어야 로테이션 해석이 정확해집니다.
 급등 Top10은 이 워치리스트(대형주) 기준이라 초소형주 포함 시장 전체 순위와는 다릅니다.
 
 **Q. 브리핑 말투/구성을 바꾸고 싶어요.**
