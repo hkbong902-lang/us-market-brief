@@ -22,6 +22,14 @@ from zoneinfo import ZoneInfo
 import requests
 import yfinance as yf
 
+# 윈도우 콘솔(cp949)에서 한국어·기호 출력이 UnicodeEncodeError로 죽지 않도록 한다.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 ET = ZoneInfo("America/New_York")
 KST = ZoneInfo("Asia/Seoul")
 
