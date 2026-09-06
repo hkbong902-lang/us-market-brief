@@ -10,6 +10,7 @@ US Market Daily Brief -> Telegram
               CLAUDE_MODEL (기본: claude-sonnet-5)
               USE_WEB_SEARCH ("0"이면 뉴스 웹검색 비활성, 기본 활성)
               SKIP_ON_HOLIDAY ("1"이면 휴장일에 아무것도 안 보냄, 기본은 휴장 안내 발송)
+              FORCE_SEND ("1"이면 휴장 판정을 무시하고 직전 마감 세션 브리핑을 발송. 테스트용)
 """
 
 import json
@@ -391,15 +392,20 @@ def main():
 
     # 아침 7시(KST) 실행 시, 마감된 세션은 'ET 기준 오늘' 날짜여야 함.
     # 아니라면 그날 미국장은 휴장(공휴일)이었던 것.
+    # FORCE_SEND=1이면 휴장 판정을 건너뛰고 직전 마감 세션으로 정상 브리핑을 만든다.
+    # 주말·공휴일에도 전체 경로(Claude API·웹검색·발송)를 검증할 수 있게 하는 스위치.
     if session != now_et.date():
-        if os.environ.get("SKIP_ON_HOLIDAY") == "1":
+        if os.environ.get("FORCE_SEND") == "1":
+            print(f"FORCE_SEND=1 → 휴장 판정을 무시하고 직전 마감 세션({session}) 기준으로 발송")
+        elif os.environ.get("SKIP_ON_HOLIDAY") == "1":
             print(f"휴장 감지(최근 세션 {session}) → 발송 생략")
             return
-        send_telegram(
-            f"🇺🇸 어제({now_et:%m/%d} 현지)는 미국 증시 휴장일이었습니다.\n"
-            f"직전 거래일은 {session}이며, 해당 브리핑은 이미 발송되었습니다."
-        )
-        return
+        else:
+            send_telegram(
+                f"🇺🇸 어제({now_et:%m/%d} 현지)는 미국 증시 휴장일이었습니다.\n"
+                f"직전 거래일은 {session}이며, 해당 브리핑은 이미 발송되었습니다."
+            )
+            return
 
     brief = None
     try:
