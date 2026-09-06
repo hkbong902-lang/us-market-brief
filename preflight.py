@@ -31,8 +31,8 @@ def report(label, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}  {label}" + (f" — {detail}" if detail else ""))
 
 
-def shape(name, pattern, required=True):
-    """환경변수의 형태만 검사하고 (원본값, 정리된 값)을 돌려준다."""
+def shape(name, pattern, hint, required=True):
+    """환경변수의 형태만 검사한다. 값은 절대 출력하지 않고 길이와 판정만 보고한다."""
     raw = os.environ.get(name, "")
     if not raw:
         report(f"{name} 등록", not required, "값이 비어 있음")
@@ -45,13 +45,15 @@ def shape(name, pattern, required=True):
                f"값에 줄바꿈이 {val.count(chr(10))}개 있음 → 설명문을 붙여넣었을 가능성")
         return None
     good = bool(re.fullmatch(pattern, val))
-    report(f"{name} 형태", good, f"길이 {len(val)}자" + ("" if good else f", 기대 형태와 다름"))
+    report(f"{name} 형태", good,
+           f"길이 {len(val)}자" if good else f"길이 {len(val)}자 → 기대: {hint}")
     return val if good else None
 
 
 print("=" * 60)
 print("1) TELEGRAM_BOT_TOKEN")
-token = shape("TELEGRAM_BOT_TOKEN", r"\d{6,12}:[A-Za-z0-9_-]{30,}")
+token = shape("TELEGRAM_BOT_TOKEN", r"\d{6,12}:[A-Za-z0-9_-]{30,}",
+              "숫자 9~10자리 + ':' + 영문숫자 35자 = 총 45자 안팎. BotFather가 준 한 줄 전체")
 if token:
     try:
         r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=30)
@@ -66,7 +68,8 @@ if token:
 
 print()
 print("2) TELEGRAM_CHAT_ID")
-chat_id = shape("TELEGRAM_CHAT_ID", r"-?\d{5,20}")
+chat_id = shape("TELEGRAM_CHAT_ID", r"-?\d{5,20}",
+                "숫자만. 개인 대화방은 보통 9~10자리 (그룹은 앞에 '-')")
 if token and chat_id:
     try:
         r = requests.get(f"https://api.telegram.org/bot{token}/getChat",
@@ -82,7 +85,8 @@ if token and chat_id:
 
 print()
 print("3) ANTHROPIC_API_KEY (선택)")
-key = shape("ANTHROPIC_API_KEY", r"sk-ant-[A-Za-z0-9_\-]{20,}", required=False)
+key = shape("ANTHROPIC_API_KEY", r"sk-ant-[A-Za-z0-9_\-]{80,}",
+            "'sk-ant-api03-' 로 시작하는 100자 이상의 한 줄", required=False)
 if key:
     try:
         r = requests.post(
