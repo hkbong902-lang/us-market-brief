@@ -70,6 +70,24 @@ def _tables(html):
     return pd.read_html(io.StringIO(html))
 
 
+def _code_map(html):
+    """종목명 → 종목코드. 링크 태그 안에서 이름과 코드를 '함께' 뽑는다.
+
+    코드만 따로 훑어 표의 행 순번과 짝지으면, 표 밖의 종목 링크(추천·인기 종목 등)가
+    하나만 섞여도 전체가 한 칸씩 밀린다. 그 결과는 예외가 아니라 '다른 종목의 코드가
+    조용히 붙은 행'이고, 등락률은 네이버 값이라 맞아 보이므로 눈으로는 걸러지지 않는다
+    (실제로 액스비스에 광전자의 코드가 붙었다). 링크 하나에서 이름과 코드를 같이
+    꺼내면 순번이라는 매개가 사라져 이 어긋남 자체가 성립하지 않는다.
+    """
+    out = {}
+    for code, name in re.findall(
+            r'/item/main\.naver\?code=(\d{6})"[^>]*>([^<]+)</a>', html):
+        nm = name.strip().rstrip(" *")
+        if nm and nm not in out:
+            out[nm] = code
+    return out
+
+
 def _num(v):
     """'+23.99%' → 23.99 / '-1.25%' → -1.25. 파싱 불가면 None."""
     if v is None:
@@ -85,7 +103,7 @@ def naver_gainers(market):
     """네이버 등락률 순위에서 시장 전체를 등락률 내림차순으로 받는다."""
     sosok = 0 if market == "KOSPI" else 1
     html = _get(f"{NAVER}/sise/sise_rise.naver?sosok={sosok}")
-    codes = re.findall(r"/item/main\.naver\?code=(\d{6})", html)
+    cmap = _code_map(html)
     tbl = None
     for t in _tables(html):
         cols = [str(c) for c in t.columns]
@@ -101,15 +119,13 @@ def naver_gainers(market):
         name = str(r.get("종목명", "")).strip()
         if chg is None or not name or name == "nan":
             continue
-        # 코드는 표의 행 순서와 같은 순서로 뽑히므로, 걸러낸 행도 자리를 소비해야
-        # 이후 종목과 코드가 어긋나지 않는다. 필터는 코드를 짝지은 뒤에 적용한다.
-        code = codes[len(rows) + len(skipped)] if (len(rows) + len(skipped)) < len(codes) else None
         if EXCLUDE_ETP and ETP_PAT.search(name):
             skipped.append(name)
             continue
+        clean = name.rstrip(" *")
         rows.append({
-            "name": name.rstrip(" *"),
-            "code": code,
+            "name": clean,
+            "code": cmap.get(clean),
             "market": market,
             "chg_pct_d": round(chg, 2),
             "volume": int(r["거래량"]) if pd.notna(r.get("거래량")) else None,
@@ -149,7 +165,7 @@ def naver_sectors():
 def naver_sector_members(no):
     """업종 구성종목 전체를 등락률 내림차순으로."""
     html = _get(f"{NAVER}/sise/sise_group_detail.naver?type=upjong&no={no}")
-    codes = re.findall(r"/item/main\.naver\?code=(\d{6})", html)
+    cmap = _code_map(html)
     tbl = None
     for t in _tables(html):
         cols = [str(c) for c in t.columns]
@@ -164,14 +180,19 @@ def naver_sector_members(no):
         name = str(r.get("종목명", "")).strip()
         if chg is None or not name or name == "nan":
             continue
+        # 네이버는 업종 구성종목 중 코스닥 종목에 ' *'를 붙인다.
+        clean = name.rstrip(" *")
         rows.append({
-            # 네이버는 업종 구성종목 중 코스닥 종목에 ' *'를 붙인다.
-            "name": name.rstrip(" *"),
-            "code": codes[len(rows)] if len(rows) < len(codes) else None,
+            "name": clean,
+            "code": cmap.get(clean),
             "market": "KOSDAQ" if name.endswith("*") else "KOSPI",
             "chg_pct_d": round(chg, 2),
             "volume": int(r["거래량"]) if pd.notna(r.get("거래량")) else None,
         })
+    missing = [r["name"] for r in rows if not r.get("code")]
+    if missing:
+        print(f"업종 {no}: 코드를 찾지 못한 종목 {len(missing)}개 → "
+              f"{', '.join(missing[:5])}", file=sys.stderr)
     rows.sort(key=lambda x: x["chg_pct_d"], reverse=True)
     return rows
 
@@ -496,8 +517,16 @@ def main():
         if not brief:
             reason = "ANTHROPIC_API_KEY 미설정 또는 빈 응답"
     except Exception as e:
-        reason = str(e)[:300]
-        print(f"Claude API 실패 → 기본 브리핑으로 대체: {e}", file=sys.stderr)
+        # requests가 raise_for_status로 올린 예외에는 응답 객체가 붙어 있고, 사유는
+        # 상태줄이 아니라 그 본문에 있다("credit balance is too low" 등). 상태코드만
+        # 보고하면 결제 문제와 요청 오류가 같은 문장으로 보여 진단이 한 단계 늦어진다.
+        body = getattr(getattr(e, "response", None), "text", "") or ""
+        try:
+            body = json.loads(body).get("error", {}).get("message", "") or body
+        except Exception:
+            pass
+        reason = (f"{e} — {body}" if body else str(e))[:400]
+        print(f"Claude API 실패 → 기본 브리핑으로 대체: {reason}", file=sys.stderr)
     if not brief:
         brief = build_kr_fallback_brief(data, reason)
 
