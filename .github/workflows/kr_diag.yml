@@ -1,0 +1,53 @@
+name: KR Brief Diagnostic (temporary)
+
+# 400 Bad Request의 실제 사유를 확인하기 위한 임시 워크플로.
+# 운영 워크플로(daily_brief.yml / kr_brief.yml)와 main.py는 건드리지 않는다.
+# 텔레그램 발송 없음. 원인 확인이 끝나면 이 파일은 삭제한다.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe A — 최소 요청 (키·결제 상태만 본다)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo "키 길이: ${#ANTHROPIC_API_KEY}"
+          curl -sS -o body.txt -w "HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d '{"model":"claude-sonnet-5","max_tokens":16,
+                 "messages":[{"role":"user","content":"ping"}]}'
+          echo "--- 응답 본문 ---"; cat body.txt; echo
+
+      - name: Probe B — 웹검색 도구를 붙인 요청 (도구 버전 문제 확인)
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          curl -sS -o body.txt -w "HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d '{"model":"claude-sonnet-5","max_tokens":16,
+                 "messages":[{"role":"user","content":"ping"}],
+                 "tools":[{"type":"web_search_20260209","name":"web_search","max_uses":10}]}'
+          echo "--- 응답 본문 ---"; cat body.txt; echo
+
+      - name: Probe C — 한국 브리핑과 같은 조건 (스트리밍 + max_tokens 24000)
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          curl -sS -o body.txt -w "HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d '{"model":"claude-sonnet-5","max_tokens":24000,"stream":true,
+                 "messages":[{"role":"user","content":"ping"}],
+                 "tools":[{"type":"web_search_20260209","name":"web_search","max_uses":10}]}'
+          echo "--- 응답 본문(앞부분) ---"; head -c 800 body.txt; echo
