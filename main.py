@@ -8,7 +8,11 @@ US Market Daily Brief -> Telegram
 필수 환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 선택 환경변수: ANTHROPIC_API_KEY (없으면 수치 위주 기본 브리핑으로 발송)
               CLAUDE_MODEL (기본: claude-sonnet-5)
+              CLAUDE_MAX_TOKENS (한 응답의 생성 토큰 상한. 기본 32000.
+                                 사고·웹검색·본문이 이 한 예산을 공유한다)
               USE_WEB_SEARCH ("0"이면 뉴스 웹검색 비활성, 기본 활성)
+              WEB_SEARCH_TOOL_TYPE (기본: web_search_20260209.
+                                    구형 모델을 쓰면 web_search_20250305)
               SKIP_ON_HOLIDAY ("1"이면 휴장일에 아무것도 안 보냄, 기본은 휴장 안내 발송)
               FORCE_SEND ("1"이면 휴장 판정을 무시하고 직전 마감 세션 브리핑을 발송. 테스트용)
 """
@@ -640,11 +644,90 @@ SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데스�
     각각 한 문장씩 구분해 줄 것.
 - 웹검색이 가능하면 급등락 '이유'(실적, 뉴스, 지표)를 확인해 서사에 녹일 것. 확인 안 되는
   이유는 추정하지 말고 수치만 기술.
+- ★검색 결과의 영어 원문을 그대로 옮겨 적지 말 것. 반드시 한국어로 소화해 서술한다.
+  브리핑 전체에 영어 문장이 한 줄도 있어서는 안 된다(회사명·티커 표기는 예외).
 - 제공된 수치를 임의로 바꾸지 말 것. 없는 수치는 만들지 말 것. 데이터에 없는 필드(이력 부족으로
   빠진 항목)는 언급하지 말고 있는 지표로만 판단할 것.
 - 마지막에 '투자 권유가 아닌 정보 제공 목적' 1줄.
 - ④의 3블록에 지면을 가장 많이 쓸 것. ⑤는 압축적으로. ①②③⑥⑦이 길어져 ④가 밀리면 실패한 브리핑이다.
-- 전체 길이는 텔레그램 3~5개 메시지 이내(약 10,000자 이내)."""
+- 전체 길이는 텔레그램 3~5개 메시지 이내(약 10,000자 이내).
+- ★①부터 ⑦까지와 마지막 면책 문구를 반드시 완결할 것. 분량이 부족하다고 느껴지면
+  ⑤⑥⑦을 짧게 압축하되, 섹션을 통째로 빠뜨리거나 문장 중간에서 멈추지 말 것.
+  중간에서 끊긴 브리핑은 어떤 이유로도 허용되지 않는다."""
+
+
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+MAX_CONTINUATIONS = 2      # 이어쓰기 재요청 횟수 상한(원 호출 + 최대 2회)
+PREAMBLE_MAX = 300         # 검색 직전 안내 멘트로 간주할 text 블록의 최대 길이
+
+
+def _extract_brief_text(content):
+    """응답 블록에서 브리핑 본문만 모은다.
+
+    웹검색을 쓰면 "검색해 보겠습니다" 같은 짧은 안내 멘트가 검색 호출 직전의 text 블록으로
+    온다. 이전 구현은 '마지막 검색 이후의 텍스트만' 취해 이를 걸렀는데, 그 규칙은 모델이
+    검색을 모두 끝낸 뒤에야 글을 쓴다는 전제에 기대고 있었다. 지금 프롬프트는 섹터마다
+    촉매를 확인하라고 요구하므로 검색은 작성 도중에도 일어나고, 그러면 검색 이전에 쓴
+    본문이 통째로 버려진다. 그래서 규칙을 뒤집는다 — 검색 호출 '바로 앞'의 '짧은' text
+    블록만 안내 멘트로 보고 버리고, 나머지는 모두 본문으로 취급한다.
+    thinking 블록은 type이 text가 아니므로 자연히 제외된다.
+    """
+    parts = []
+    for i, block in enumerate(content):
+        if block.get("type") != "text":
+            continue
+        text = block.get("text", "")
+        nxt = content[i + 1] if i + 1 < len(content) else None
+        if nxt and nxt.get("type") == "server_tool_use" and len(text.strip()) <= PREAMBLE_MAX:
+            continue
+        if text.strip():
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _call_claude(api_key, body):
+    """SSE 스트리밍으로 호출하고 {"content": [...], "stop_reason": ...} 로 되돌린다.
+
+    비스트리밍으로는 큰 max_tokens를 쓸 수 없다. 이 요청은 adaptive thinking + 웹검색 +
+    1만 자 본문이 한 응답에 들어가므로 생성에 수 분이 걸리고, 비스트리밍 요청은 그 구간에서
+    HTTP 타임아웃에 걸린다. 스트리밍은 그 제약을 없애준다.
+    """
+    resp = requests.post(
+        ANTHROPIC_URL,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json=dict(body, stream=True),
+        timeout=(30, 900),      # (연결, 청크 간 무응답) — 총 소요시간 제한이 아니다
+        stream=True,
+    )
+    resp.raise_for_status()
+
+    content, stop_reason = [], None
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data:"):
+            continue
+        try:
+            ev = json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        etype = ev.get("type")
+        idx = ev.get("index")
+        if etype == "content_block_start" and idx is not None:
+            while len(content) <= idx:
+                content.append({})
+            content[idx] = dict(ev.get("content_block", {}))
+        elif etype == "content_block_delta" and idx is not None and idx < len(content):
+            delta = ev.get("delta", {})
+            if delta.get("type") == "text_delta":
+                content[idx]["text"] = content[idx].get("text", "") + delta.get("text", "")
+        elif etype == "message_delta":
+            stop_reason = ev.get("delta", {}).get("stop_reason", stop_reason)
+        elif etype == "error":
+            raise RuntimeError(f"Claude 스트림 오류: {ev.get('error')}")
+    return {"content": content, "stop_reason": stop_reason}
 
 
 def build_brief_with_claude(data):
@@ -654,53 +737,69 @@ def build_brief_with_claude(data):
     model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
     tools = []
     if os.environ.get("USE_WEB_SEARCH", "1") != "0":
-        tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+        # 동적 필터링이 들어간 현행 변형. 구형 모델을 쓰게 되면 WEB_SEARCH_TOOL_TYPE로
+        # web_search_20250305 으로 되돌릴 수 있다.
+        tools = [{
+            "type": os.environ.get("WEB_SEARCH_TOOL_TYPE", "web_search_20260209"),
+            "name": "web_search",
+            "max_uses": 5,
+        }]
+
+    user_turn = {
+        "role": "user",
+        "content": (
+            f"기준 세션: {data['session_date']} (직전 세션 {data['prev_session_date']}).\n"
+            "아래 실측 데이터로 브리핑을 작성해 주세요.\n\n"
+            + json.dumps(data, ensure_ascii=False)
+        ),
+    }
     body = {
         "model": model,
-        "max_tokens": int(os.environ.get("CLAUDE_MAX_TOKENS", "14000")),
+        # max_tokens는 '본문 길이'가 아니라 한 응답이 생성하는 모든 토큰의 상한이다.
+        # 여기에는 (1) adaptive thinking — 이 모델은 thinking을 생략해도 기본 동작이다,
+        # (2) 웹검색 호출과 그 결과 블록, (3) 실제 브리핑 본문이 모두 들어간다.
+        # 게다가 한국어는 글자당 1.5~2토큰이라 '1만 자'는 1.5만~2만 토큰이다.
+        # 이 셋을 한 예산에 넣고 1.4만으로 잡았더니 사고와 검색이 먼저 예산을 쓰고
+        # 브리핑은 ①만 나온 채 잘렸다. 상한일 뿐 실제 생성량만 과금된다.
+        "max_tokens": int(os.environ.get("CLAUDE_MAX_TOKENS", "32000")),
         "system": SYSTEM_PROMPT,
-        "messages": [{
-            "role": "user",
-            "content": (
-                f"기준 세션: {data['session_date']} (직전 세션 {data['prev_session_date']}).\n"
-                "아래 실측 데이터로 브리핑을 작성해 주세요.\n\n"
-                + json.dumps(data, ensure_ascii=False)
-            ),
-        }],
+        "messages": [user_turn],
     }
     if tools:
         body["tools"] = tools
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json=body,
-        timeout=300,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-    content = payload.get("content", [])
 
-    # 웹검색을 쓰면 "검색해 보겠습니다" 같은 중간 멘트도 text 블록으로 온다.
-    # 마지막 검색 결과 이후의 텍스트만 브리핑 본문으로 사용한다.
-    last_search = -1
-    for i, block in enumerate(content):
-        if block.get("type") in ("server_tool_use", "web_search_tool_result"):
-            last_search = i
-    tail = content[last_search + 1:] if last_search >= 0 else content
-
-    def join_text(blocks):
-        return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
-
-    text = join_text(tail) or join_text(content)
-
-    if payload.get("stop_reason") == "max_tokens":
-        print("경고: Claude 응답이 max_tokens에서 잘렸습니다. CLAUDE_MAX_TOKENS를 올리세요.",
+    # 예산을 늘려도 절단 가능성은 남는다(검색 결과 분량은 실행마다 다르다). 잘렸으면
+    # 지금까지 쓴 본문을 assistant 턴으로 되돌려주고 끊긴 지점부터 이어 쓰게 한다.
+    # 무인 실행이라 잘린 브리핑이 그대로 발송되는 것이 가장 나쁜 결과다.
+    parts = []
+    for attempt in range(MAX_CONTINUATIONS + 1):
+        payload = _call_claude(api_key, body)
+        chunk = _extract_brief_text(payload["content"])
+        if chunk:
+            parts.append(chunk)
+        if payload["stop_reason"] != "max_tokens":
+            break
+        so_far = "".join(parts).rstrip()      # assistant 턴이 공백으로 끝나면 API가 거부한다
+        if attempt == MAX_CONTINUATIONS or not so_far:
+            print(f"경고: 이어쓰기 {attempt}회 후에도 응답이 max_tokens에서 잘렸습니다. "
+                  "CLAUDE_MAX_TOKENS를 올리거나 SYSTEM_PROMPT의 분량 지시를 줄이세요.",
+                  file=sys.stderr)
+            break
+        print(f"응답이 max_tokens에서 잘림 → 이어쓰기 요청 {attempt + 1}/{MAX_CONTINUATIONS}",
               file=sys.stderr)
-    return text or None
+        body["messages"] = [
+            user_turn,
+            {"role": "assistant", "content": so_far},
+            {"role": "user", "content": (
+                "위 브리핑이 분량 한도에 걸려 중간에서 끊겼습니다. 끊긴 바로 그 지점부터 "
+                "이어서 나머지를 작성해 주세요. 이미 쓴 부분을 다시 쓰거나 요약하지 말고, "
+                "머리말·사과·설명 없이 곧바로 이어지는 문장부터 시작하세요. "
+                "마지막 면책 문구까지 반드시 완결할 것."
+            )},
+        ]
+
+    # 이어쓰기 조각은 문장 중간에서 갈라진 것이므로 구분자 없이 그대로 붙인다.
+    return "".join(parts).strip() or None
 
 
 def _fmt_trend(m):
