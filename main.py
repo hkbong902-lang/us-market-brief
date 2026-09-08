@@ -199,26 +199,135 @@ TELEGRAM_MAX = 4096
 
 
 # ── 데이터 수집 유틸 ─────────────────────────────────────────────────────────
-def download_closes(tickers, start=None, period=None):
-    """yfinance 일봉 종가 DataFrame (index=date, columns=ticker)."""
+# 추세·상대강도를 계산하려면 200일 이동평균과 52주 고저가 필요하다. 달력 520일이면
+# 언제 실행해도 거래일 약 350개가 확보되고, 동시에 항상 전년 12월을 포함하므로
+# 연초 대비 수익률까지 같은 시계열 한 번의 다운로드에서 나온다.
+HISTORY_DAYS = 520
+BENCHMARK = "^GSPC"          # 상대강도(RS)의 기준 지수
+TRADING_DAYS_52W = 252
+
+
+def download_history(tickers, start=None, period=None):
+    """yfinance 일봉을 {ticker: {"close": Series, "volume": Series|None}} 로 반환."""
+    tickers = list(tickers)
     df = yf.download(
         tickers=" ".join(tickers), start=start, period=period,
         interval="1d", auto_adjust=False, progress=False, group_by="ticker",
         threads=True,
     )
-    closes = {}
+    out = {}
     for t in tickers:
         try:
-            s = df[t]["Close"].dropna() if len(tickers) > 1 else df["Close"].dropna()
-            if len(s) > 0:
-                closes[t] = s
+            sub = df[t] if len(tickers) > 1 else df
+            close = sub["Close"].dropna()
+            if len(close) == 0:
+                continue
+            volume = sub["Volume"].reindex(close.index) if "Volume" in sub else None
+            out[t] = {"close": close, "volume": volume}
         except Exception:
             continue
-    return closes
+    return out
 
 
 def pct(a, b):
     return (a - b) / b * 100.0
+
+
+def _ret(close, n):
+    """n 거래일 전 종가 대비 수익률(%). 이력이 모자라면 None."""
+    if len(close) <= n:
+        return None
+    return round(pct(float(close.iloc[-1]), float(close.iloc[-1 - n])), 2)
+
+
+def _ret_at(close, n, offset):
+    """offset 거래일 전 시점에서 본 n 거래일 수익률(%). 순위의 '변화'를 내기 위한 것."""
+    if len(close) <= n + offset:
+        return None
+    return pct(float(close.iloc[-1 - offset]), float(close.iloc[-1 - offset - n]))
+
+
+def _vs_ma(close, n):
+    """n일 단순이동평균 대비 이격도(%). 이력이 모자라면 None."""
+    if len(close) < n:
+        return None
+    return round(pct(float(close.iloc[-1]), float(close.iloc[-n:].mean())), 2)
+
+
+def trend_metrics(close, volume=None):
+    """추세·상대강도 지표 묶음.
+
+    독자의 전략이 추세추종·섹터 상대강도인데 1일 등락률만 모델에 주면 '오늘 올랐다'
+    이상을 쓸 수 없다. 다기간 수익률·이동평균 위치·52주 고점 거리·거래량 배수를 함께
+    실어야 오늘의 등락이 추세의 연장인지 반전인지 판단할 근거가 생긴다.
+    이력이 모자라 계산되지 않는 항목은 None으로 두고 직렬화 단계에서 제거한다
+    (모델에게 'N/A 목록'을 읽히지 않기 위해서).
+    """
+    m = {
+        "chg_pct_d": _ret(close, 1),
+        "ret_5d": _ret(close, 5),
+        "ret_20d": _ret(close, 20),
+        "ret_60d": _ret(close, 60),
+        "vs_ma50": _vs_ma(close, 50),
+        "vs_ma200": _vs_ma(close, 200),
+    }
+    if len(close) >= 200:
+        m["ma50_over_ma200"] = bool(
+            float(close.iloc[-50:].mean()) > float(close.iloc[-200:].mean())
+        )
+    if len(close) >= 60:
+        win = close.iloc[-TRADING_DAYS_52W:]
+        px = float(close.iloc[-1])
+        m["pct_from_52w_high"] = round(pct(px, float(win.max())), 2)
+        m["pct_above_52w_low"] = round(pct(px, float(win.min())), 2)
+    if volume is not None:
+        v = volume.dropna()
+        if len(v) >= 21:
+            avg20 = float(v.iloc[-21:-1].mean())
+            if avg20 > 0:
+                m["vol_x_avg20"] = round(float(v.iloc[-1]) / avg20, 2)
+    return m
+
+
+def strip_none(d):
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def brief_row(m, *extra):
+    """watchlist_all에 전문이 이미 실려 있으므로, 편의용 목록은 필요한 필드만 싣는다."""
+    keys = ("ticker", "name", "group", "chg_pct_d") + extra
+    return {k: m[k] for k in keys if k in m}
+
+
+def attach_rs_rank(rows, hist, bench_close, lookback=20, ago=5):
+    """20일 상대강도 순위와 ago 거래일 전 순위, 그 변화량을 각 행에 붙인다.
+
+    순위의 절대값보다 '변화'가 중요하다. 오늘 1등이어도 20일 RS 순위가 계속 하위권이면
+    주도가 아니라 반등이고, 순위가 며칠째 올라오는 섹터가 자금이 실제로 옮겨가는 곳이다.
+    """
+    def ranked(offset):
+        b = _ret_at(bench_close, lookback, offset)
+        if b is None:
+            return {}
+        vals = []
+        for r in rows:
+            h = hist.get(r["ticker"])
+            v = _ret_at(h["close"], lookback, offset) if h else None
+            if v is not None:
+                vals.append((r["ticker"], v - b))
+        vals.sort(key=lambda x: x[1], reverse=True)
+        return {t: i + 1 for i, (t, _) in enumerate(vals)}
+
+    now, before = ranked(0), ranked(ago)
+    for r in rows:
+        cur = now.get(r["ticker"])
+        if cur is None:
+            continue
+        r["rs_rank_20d"] = cur
+        prev = before.get(r["ticker"])
+        if prev is not None:
+            r["rs_rank_20d_5d_ago"] = prev
+            r["rs_rank_change_5d"] = prev - cur      # 양수면 순위 상승
 
 
 def latest_session_info(closes_gspc):
@@ -230,117 +339,221 @@ def latest_session_info(closes_gspc):
 
 
 def collect_market_data():
-    year = datetime.now(ET).year
-    prev_year_end_start = f"{year - 1}-12-15"
+    now_et = datetime.now(ET)
+    year = now_et.year
+    start = (now_et - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
 
-    # 1) 지수/금리/유가: 전년 말부터 받아 T, T-1, 전년말 종가를 한 번에 확보
-    idx = download_closes(list(INDICES.keys()), start=prev_year_end_start)
-    if "^GSPC" not in idx or len(idx["^GSPC"]) < 2:
+    # 1) 지수/금리/유가 — 같은 시계열에서 전년말 종가와 추세 지표를 동시에 뽑는다.
+    idx = download_history(list(INDICES.keys()), start=start)
+    if BENCHMARK not in idx or len(idx[BENCHMARK]["close"]) < 2:
         raise RuntimeError("지수 데이터 수집 실패(^GSPC)")
 
-    t_date, t1_date = latest_session_info(idx["^GSPC"])
+    bench_close = idx[BENCHMARK]["close"]
+    t_date, t1_date = latest_session_info(bench_close)
+    bench = trend_metrics(bench_close)
+
+    # 주식류(섹터 ETF·메가캡 후보·워치리스트)는 중복을 없애 한 번에 받는다.
+    equities = sorted(set(MOVER_WATCHLIST) | set(NASDAQ_MEGACAP_CANDIDATES) | set(SECTOR_ETFS))
+    hist = download_history(equities, start=start)
+    metrics = {
+        t: trend_metrics(h["close"], h.get("volume"))
+        for t, h in hist.items() if len(h["close"]) >= 2
+    }
+
+    def rs(m, field="ret_20d"):
+        """벤치마크(S&P500) 대비 초과수익(%p) — 섹터 상대강도의 핵심 축."""
+        if m.get(field) is None or bench.get(field) is None:
+            return None
+        return round(m[field] - bench[field], 2)
 
     indicators = []
     for ticker, name in INDICES.items():
-        s = idx.get(ticker)
-        if s is None or len(s) < 2:
+        h = idx.get(ticker)
+        if h is None or len(h["close"]) < 2:
             indicators.append({"ticker": ticker, "name": name, "error": "N/A"})
             continue
+        s = h["close"]
+        m = trend_metrics(s)
         t_close = float(s.iloc[-1])
-        t1_close = float(s.iloc[-2])
         prev_year = s[s.index.year == (year - 1)]
         ye_close = float(prev_year.iloc[-1]) if len(prev_year) else None
         row = {"ticker": ticker, "name": name, "close": round(t_close, 3)}
-        if ticker == "^TNX":  # 금리는 bp 변동
-            row["chg_bp_d"] = round((t_close - t1_close) * 100, 1)
+        if ticker == "^TNX":                      # 금리는 bp 변동으로 읽는다
+            row["chg_bp_d"] = round((t_close - float(s.iloc[-2])) * 100, 1)
+            if len(s) > 20:
+                row["chg_bp_20d"] = round((t_close - float(s.iloc[-21])) * 100, 1)
             if ye_close:
                 row["chg_bp_ytd"] = round((t_close - ye_close) * 100, 1)
         else:
-            row["chg_pct_d"] = round(pct(t_close, t1_close), 2)
+            row["chg_pct_d"] = m.get("chg_pct_d")
+            row["ret_20d"] = m.get("ret_20d")
+            row["ret_60d"] = m.get("ret_60d")
             if ye_close:
                 row["chg_pct_ytd"] = round(pct(t_close, ye_close), 2)
-        indicators.append(row)
+        row["vs_ma50"] = m.get("vs_ma50")
+        row["vs_ma200"] = m.get("vs_ma200")
+        row["pct_from_52w_high"] = m.get("pct_from_52w_high")
+        indicators.append(strip_none(row))
 
-    # 2) 섹터 ETF: 일일 등락률
-    sec = download_closes(list(SECTOR_ETFS.keys()), period="10d")
+    # 2) 섹터 ETF — 1일 등락에 다기간 수익률·RS·이동평균 위치·RS 순위 변화를 더한다.
     sectors = []
     for ticker, name in SECTOR_ETFS.items():
-        s = sec.get(ticker)
-        if s is None or len(s) < 2:
+        m = metrics.get(ticker)
+        if not m or m.get("chg_pct_d") is None:
             continue
-        sectors.append({
-            "ticker": ticker, "name": name,
-            "chg_pct_d": round(pct(float(s.iloc[-1]), float(s.iloc[-2])), 2),
-        })
+        row = {"ticker": ticker, "name": name}
+        row.update(m)
+        row["rs_20d_vs_spx"] = rs(m, "ret_20d")
+        row["rs_60d_vs_spx"] = rs(m, "ret_60d")
+        sectors.append(strip_none(row))
+    attach_rs_rank(sectors, hist, bench_close)
     sectors.sort(key=lambda x: x["chg_pct_d"], reverse=True)
 
-    # 3) 나스닥 시총 상위 10 (+ 일일 등락률)
-    mega_prices = download_closes(NASDAQ_MEGACAP_CANDIDATES, period="10d")
+    # 3) 나스닥 시총 상위 10 (+ 추세 지표)
     megacaps = []
     for t in NASDAQ_MEGACAP_CANDIDATES:
-        s = mega_prices.get(t)
-        if s is None or len(s) < 2:
+        m = metrics.get(t)
+        if not m or m.get("chg_pct_d") is None:
             continue
         try:
             mcap = yf.Ticker(t).fast_info.get("marketCap")
         except Exception:
             mcap = None
+        if not mcap:
+            continue
         # 개별 종목의 종가는 브리핑에 쓰지 않으므로 아예 싣지 않는다.
-        megacaps.append({
-            "ticker": t,
-            "name": TICKER_NAMES.get(t, t),
-            "chg_pct_d": round(pct(float(s.iloc[-1]), float(s.iloc[-2])), 2),
-            "market_cap": mcap,
-        })
-    megacaps = [m for m in megacaps if m["market_cap"]]
+        row = {"ticker": t, "name": TICKER_NAMES.get(t, t), "market_cap": mcap}
+        row.update(m)
+        row["rs_20d_vs_spx"] = rs(m)
+        megacaps.append(strip_none(row))
     megacaps.sort(key=lambda x: x["market_cap"], reverse=True)
     megacaps = megacaps[:10]
 
     # 4) 워치리스트 급등락 스캔 — 전 종목을 그대로 실어 보낸다.
     #    상위/하위 몇 개만 보내면 "반도체가 오른 날 하락한 SaaS" 같은 로테이션 서사를 쓸
     #    근거가 모델에 도달하지 않는다. 테마 반대편이면 하락폭이 작아도 중요한 종목이다.
-    wl = download_closes(sorted(set(MOVER_WATCHLIST)), period="10d")
     movers = []
-    for t, s in wl.items():
-        if len(s) < 2:
+    for t in sorted(set(MOVER_WATCHLIST)):
+        m = metrics.get(t)
+        if not m or m.get("chg_pct_d") is None:
             continue
-        movers.append({
-            "ticker": t,
-            "name": TICKER_NAMES.get(t, t),
-            "group": TICKER_GROUP.get(t, "기타"),
-            "chg_pct_d": round(pct(float(s.iloc[-1]), float(s.iloc[-2])), 2),
-        })
+        row = {"ticker": t, "name": TICKER_NAMES.get(t, t), "group": TICKER_GROUP.get(t, "기타")}
+        row.update(m)
+        row["rs_20d_vs_spx"] = rs(m)
+        # 94행에 실리는 필드는 최소로. 52주 저점 대비는 스핀오프 종목에서 네 자릿수가
+        # 나와 오독을 부르고, 정배열 여부는 vs_ma50/vs_ma200 부호로 이미 읽힌다.
+        row.pop("pct_above_52w_low", None)
+        row.pop("ma50_over_ma200", None)
+        movers.append(strip_none(row))
     movers.sort(key=lambda x: x["chg_pct_d"], reverse=True)
-    gainers = movers[:10]
-    losers = list(reversed(movers[-10:]))
 
-    # 그룹별 평균 등락률 — 그날 자금이 어느 테마에서 어느 테마로 돌았는지 드러낸다.
+    gainers = [brief_row(m, "ret_20d", "vs_ma200") for m in movers[:10]]
+    losers = [brief_row(m, "ret_20d", "vs_ma200") for m in reversed(movers[-10:])]
+
+    # 오늘의 등락 순위와 '20일 추세' 순위는 서로 다른 순위다.
+    # 둘을 나란히 줘야 모델이 연장/반전을 가를 수 있다.
+    by_ret20 = sorted(
+        [m for m in movers if m.get("ret_20d") is not None],
+        key=lambda x: x["ret_20d"], reverse=True,
+    )
+    momentum_leaders = [brief_row(m, "ret_20d", "ret_60d", "rs_20d_vs_spx", "vs_ma200")
+                        for m in by_ret20[:10]]
+    momentum_laggards = [brief_row(m, "ret_20d", "ret_60d", "rs_20d_vs_spx", "vs_ma200")
+                         for m in reversed(by_ret20[-10:])]
+    volume_surges = [brief_row(m, "vol_x_avg20", "ret_20d") for m in sorted(
+        [m for m in movers if m.get("vol_x_avg20")],
+        key=lambda x: x["vol_x_avg20"], reverse=True,
+    )[:10]]
+
+    # 그룹별 집계 — 그날 자금이 어느 테마에서 어느 테마로 돌았는지, 그리고 그 이동이
+    # 하루짜리인지 20일째 이어지는 추세인지를 함께 드러낸다.
     group_perf = []
     for g in MOVER_WATCHLIST_GROUPS:
-        vals = [m["chg_pct_d"] for m in movers if m["group"] == g]
-        if vals:
-            group_perf.append({
-                "group": g,
-                "avg_chg_pct_d": round(sum(vals) / len(vals), 2),
-                "up": sum(1 for v in vals if v > 0),
-                "down": sum(1 for v in vals if v < 0),
-            })
-    group_perf.sort(key=lambda x: x["avg_chg_pct_d"], reverse=True)
+        members = [m for m in movers if m["group"] == g]
+        if not members:
+            continue
+
+        def avg(field, _members=members):
+            vals = [m[field] for m in _members if m.get(field) is not None]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        with50 = [m for m in members if m.get("vs_ma50") is not None]
+        with200 = [m for m in members if m.get("vs_ma200") is not None]
+        group_perf.append(strip_none({
+            "group": g,
+            "members": len(members),
+            "avg_chg_pct_d": avg("chg_pct_d"),
+            "avg_ret_5d": avg("ret_5d"),
+            "avg_ret_20d": avg("ret_20d"),
+            "avg_ret_60d": avg("ret_60d"),
+            "avg_rs_20d_vs_spx": avg("rs_20d_vs_spx"),
+            "up": sum(1 for m in members if m["chg_pct_d"] > 0),
+            "down": sum(1 for m in members if m["chg_pct_d"] < 0),
+            "above_ma50": sum(1 for m in with50 if m["vs_ma50"] > 0),
+            "above_ma50_of": len(with50) or None,
+            "above_ma200": sum(1 for m in with200 if m["vs_ma200"] > 0),
+            "above_ma200_of": len(with200) or None,
+        }))
+    for i, g in enumerate(sorted([g for g in group_perf if g.get("avg_ret_20d") is not None],
+                                key=lambda x: x["avg_ret_20d"], reverse=True), 1):
+        g["momentum_rank_20d"] = i
+    group_perf.sort(key=lambda x: x.get("avg_chg_pct_d", 0), reverse=True)
+
+    # 5) 시장 폭 — 오늘의 등락과 별개로, 워치리스트가 추세 위에 서 있는지를 본다.
+    with50 = [m for m in movers if m.get("vs_ma50") is not None]
+    with200 = [m for m in movers if m.get("vs_ma200") is not None]
+    breadth = {
+        "universe": len(movers),
+        "advancers": sum(1 for m in movers if m["chg_pct_d"] > 0),
+        "decliners": sum(1 for m in movers if m["chg_pct_d"] < 0),
+        "above_ma50": sum(1 for m in with50 if m["vs_ma50"] > 0),
+        "above_ma50_of": len(with50),
+        "above_ma200": sum(1 for m in with200 if m["vs_ma200"] > 0),
+        "above_ma200_of": len(with200),
+        "within_3pct_of_52w_high": [
+            m["ticker"] for m in movers
+            if m.get("pct_from_52w_high") is not None and m["pct_from_52w_high"] >= -3
+        ],
+        # 행에서 뺀 필드라 metrics에서 직접 읽는다.
+        "within_10pct_of_52w_low": [
+            m["ticker"] for m in movers
+            if (metrics[m["ticker"]].get("pct_above_52w_low") or 999) <= 10
+        ],
+    }
 
     return {
         "session_date": str(t_date),
         "prev_session_date": str(t1_date),
+        "benchmark": strip_none({"ticker": BENCHMARK, "name": "S&P500(상대강도 기준)", **bench}),
         "indicators": indicators,
         "sectors_by_daily_change": sectors,
         "nasdaq_top10_by_mcap": megacaps,
+        "market_breadth": breadth,
         "watchlist_group_performance": group_perf,
         "watchlist_top_gainers": gainers,
         "watchlist_top_losers": losers,
+        "watchlist_momentum_leaders": momentum_leaders,
+        "watchlist_momentum_laggards": momentum_laggards,
+        "watchlist_volume_surges": volume_surges,
         "watchlist_all": movers,
-        "note": ("watchlist_all이 워치리스트 전 종목의 등락률·소속 그룹이다(등락률 내림차순). "
-                 "top_gainers/top_losers는 그 중 상·하위 10개를 뽑아둔 편의용 목록일 뿐이며, "
+        "field_guide": {
+            "chg_pct_d": "직전 세션 1일 등락률(%)",
+            "ret_5d / ret_20d / ret_60d": "5·20·60 거래일 전 종가 대비 수익률(%). 20일이 중기 추세의 기본 축이다.",
+            "vs_ma50 / vs_ma200": "50일·200일 단순이동평균 대비 이격도(%). 양수면 추세 위, 음수면 추세 아래.",
+            "ma50_over_ma200": "true면 50일선이 200일선 위(정배열).",
+            "pct_from_52w_high": "52주 고점 대비 위치(%). 0에 가까울수록 신고가권.",
+            "pct_above_52w_low": "52주 저점 대비 위치(%).",
+            "vol_x_avg20": "직전 세션 거래량 ÷ 직전 20일 평균 거래량. 2 이상이면 이벤트가 있었다는 신호.",
+            "rs_20d_vs_spx / rs_60d_vs_spx": "해당 기간 수익률에서 S&P500 같은 기간 수익률을 뺀 값(%p). 상대강도.",
+            "rs_rank_20d / rs_rank_20d_5d_ago / rs_rank_change_5d": "섹터 ETF의 20일 상대강도 순위, 5거래일 전 순위, 그 변화(양수면 순위 상승).",
+            "momentum_rank_20d": "워치리스트 테마 그룹의 20일 평균 수익률 순위.",
+            "market_breadth": "워치리스트 전체의 상승/하락 종목 수, 50·200일선 위 종목 수, 52주 고점·저점 근접 종목.",
+        },
+        "note": ("watchlist_all이 워치리스트 전 종목의 등락률·추세 지표·소속 그룹이다(1일 등락률 내림차순). "
+                 "top_gainers/top_losers/momentum_*/volume_surges는 그 중 일부를 뽑아둔 편의용 목록일 뿐이며, "
                  "서사를 쓸 때는 반드시 watchlist_all 전체를 보고 판단할 것. "
-                 "모두 대형주 워치리스트 기준이라 시장 전체 순위와는 다르다."),
+                 "오늘의 등락률 순위와 20일 추세 순위는 서로 다르며, 그 차이가 '추세의 연장인가 반전인가'를 "
+                 "가르는 근거다. 모두 대형주 워치리스트 기준이라 시장 전체 순위와는 다르다."),
     }
 
 
@@ -349,32 +562,50 @@ SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데스�
 추세추종·섹터 상대강도 전략을 쓰는 개인투자자입니다. 제공된 실측 데이터(JSON)를 바탕으로
 직전 미국 정규장 마감 브리핑을 '이해하기 쉬운 서사형'으로 작성하세요.
 
+데이터에는 1일 등락률뿐 아니라 5·20·60일 수익률, 50·200일선 대비 이격도, 52주 고점 대비
+위치, 거래량 배수, S&P500 대비 상대강도(rs_20d_vs_spx), 섹터 상대강도 순위와 그 5일 변화가
+함께 들어 있습니다(각 필드의 뜻은 field_guide 참고). 독자의 전략이 추세추종·섹터 상대강도이므로
+★모든 해석은 "오늘 하루의 움직임이 추세의 연장인가, 반전의 시작인가"에 답해야 합니다.
+하루 등락률만 나열하고 추세를 언급하지 않은 브리핑은 실패입니다.
+
 규칙:
 - 반드시 한국어. 텔레그램 발송용이므로 마크다운 표 대신 줄단위 텍스트/이모지 사용.
 - HTML 태그는 <b>, <i>만 사용 가능(텔레그램 HTML 모드). 다른 태그 금지.
-- 개별 종목은 <b>회사명(티커)</b> 등락률 만 표기한다. 종목의 주가(종가·달러 금액)는
+- 개별 종목은 <b>회사명(티커)</b> 뒤에 등락률·추세 수치만 표기한다. 종목의 주가(종가·달러 금액)는
   브리핑 어디에도 쓰지 말 것. 지수·금리·유가·달러인덱스·VIX의 수치는 ②에 그대로 표기한다.
-- 구성: ①오늘의 서사(그날 시장을 움직인 힘을 4~6문장의 이야기로: 금리 방향과 그 이유,
-  지수 간 breadth의 의미 — 예: 소형주와 대형주의 엇갈림을 어떻게 읽어야 하는지, 유가·달러인덱스·
-  VIX 등 핵심 변수의 흐름과 함의(달러 강세/약세가 위험자산과 원자재에 주는 압력, VIX 수준이
-  말하는 시장의 경계심을 반드시 해석에 포함). 단순 요약 한 줄이 아니라 해석이 담긴 서사 문단으로 작성)
-  ②핵심 지표(10년물 bp표기·달러인덱스·WTI·다우·S&P500·나스닥·러셀2000·VIX, 전일대비/연초대비
-    수치 나열)
-  ③나스닥 시총 상위 10 등락(수치 뒤에 갈림의 축을 해석 1~2문장)
+- 수치 표기 약속(줄이 길어지지 않게 이 축약형을 쓸 것):
+  1일 등락률은 그냥 +2.1%, 20일 수익률은 20d +8.4%, 200일선 대비는 200일선 +12%,
+  상대강도는 RS +5.2%p, 거래량은 거래량 2.3배.
+- 구성:
+  ①오늘의 서사(4~6문장) — 그날 시장을 움직인 힘을 이야기로: 금리 방향과 그 이유, 지수 간
+    breadth의 의미(소형주와 대형주의 엇갈림을 어떻게 읽을지), 유가·달러인덱스·VIX의 흐름과
+    함의(달러 강세/약세가 위험자산·원자재에 주는 압력, VIX 수준이 말하는 경계심)를 반드시 해석에
+    포함. 여기에 더해 market_breadth의 50일선·200일선 위 종목 비율을 근거로 오늘의 움직임이
+    시장 전반의 추세와 같은 방향인지 다른 방향인지 한 문장으로 못박을 것.
+  ②핵심 지표 — 10년물(bp)·달러인덱스·WTI·다우·S&P500·나스닥·러셀2000·VIX를
+    '전일 / 20일 / 연초' 순으로 나열하고, 지수에는 200일선 대비 위치를 괄호로 덧붙인다.
+  ③나스닥 시총 상위 10 등락 — 종목마다 1일 등락률과 20d 수익률을 병기하고,
+    수치 뒤에 갈림의 축을 해석 1~2문장.
   ④섹터 3블록 — 브리핑의 심장이며 매일의 핵심. 개별 종목을 먼저 늘어놓지 말고, 반드시
     '섹터 → 그 섹터 안의 종목 → 서사' 순서로 쓴다. 아래 3블록을 이 순서 그대로,
     매일 똑같은 형식으로 반복할 것. 각 블록은 예외 없이 다음 (a)(b)(c) 3단으로 구성한다:
-      (a) 섹터 헤더 한 줄 — <b>섹터/테마명</b> 평균 등락률, 상승·하락 종목 수
+      (a) 섹터 헤더 한 줄 — <b>섹터/테마명</b> 오늘 평균 등락률, 상승·하락 종목 수,
+          20d 평균 수익률, RS ±%p, 그리고 대응 섹터 ETF의 RS 순위와 5일 전 대비 변화
+          (rs_rank_change_5d가 양수면 ↑n, 음수면 ↓n)
       (b) 그 섹터 안의 종목을 등락률 순으로 최소 4개 —
-          <b>회사명(티커)</b> 등락률 형식으로 한 줄씩
+          <b>회사명(티커)</b> 1일 등락률 · 20d 수익률 · 200일선 대비 형식으로 한 줄씩
       (c) 서사 3~5문장 — 이 섹터가 왜 그렇게 움직였는지. 종목별 촉매(실적, 수주,
           가이던스, 애널리스트 코멘트, 수급, 매크로)를 하나의 흐름으로 엮을 것.
-          종목 나열의 반복으로 끝내지 말 것.
+          ★마지막 한 문장은 반드시 추세 판단이다: 오늘의 움직임이 20일 추세의 연장인지,
+          되돌림인지, 추세 전환의 초기 신호인지를 20d 수익률·200일선 위치·RS 순위 변화를
+          근거로 단정할 것. 종목 나열의 반복으로 끝내지 말 것.
 
     [블록 1] 오늘 가장 많이 오른 섹터 — 무조건 이 블록으로 ④를 시작한다.
       watchlist_group_performance의 1위 그룹과 sectors_by_daily_change의 1위 섹터를 함께
       보고 그날의 주도 섹터를 정한다. 이 섹터가 그날 시장의 진앙지다.
-      (a)(b)(c)를 모두 채우고, 랠리에 불을 붙인 촉매를 반드시 밝힌다.
+      ★단, avg_chg_pct_d(오늘)만으로 정하지 말 것. avg_ret_20d·avg_rs_20d_vs_spx·
+      rs_rank_change_5d를 함께 보고, 오늘 1등이지만 20일 RS가 여전히 하위권이면 '주도'가
+      아니라 '낙폭과대 반등'이라고 명시할 것. (a)(b)(c)를 모두 채우고 촉매를 밝힌다.
 
     [블록 2] 확산 섹터 — 블록 1의 테마가 밸류체인을 타고 번진 섹터를 동일한 (a)(b)(c)
       구조로 한 번 더 쓴다(예: 반도체 랠리가 전력·냉각·광통신·스토리지·네트워크 장비로
@@ -383,24 +614,37 @@ SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데스�
 
     [블록 3] 오늘 가장 많이 하락한 반대편 섹터 — 절대 생략하거나 한두 줄로 줄이지 말 것.
       watchlist_group_performance의 최하위 그룹을 기준으로 동일한 (a)(b)(c) 구조로 쓴다.
-      ★필수: watchlist_all(워치리스트 전 종목의 등락률·소속 그룹) 전체를 보고 그 그룹에서
-      하락한 종목을 최소 4개 고른다. watchlist_top_losers 목록에 없더라도 그 그룹 소속이면
-      하락폭이 작아도 반드시 포함한다(하락폭 상위 몇 개만 훑는 것은 이 블록의 실패다).
+      ★필수: watchlist_all(워치리스트 전 종목의 등락률·추세 지표·소속 그룹) 전체를 보고 그
+      그룹에서 하락한 종목을 최소 4개 고른다. watchlist_top_losers 목록에 없더라도 그 그룹
+      소속이면 하락폭이 작아도 반드시 포함한다(하락폭 상위 몇 개만 훑는 것은 이 블록의 실패다).
       (c) 서사에서는 왜 같은 날 같은 방향으로 팔렸는지를 자금 이동으로 설명한다
       (로테이션, 멀티플 압축, 금리, AI가 기존 소프트웨어의 해자를 잠식한다는 침식 서사 등).
-      그 진영 안에서 홀로 오른 예외 종목이 있으면 이유와 함께 짚는다.
+      ★그리고 이 하락이 '추세 안에서의 조정'인지 '추세 이탈'인지를 200일선 대비 위치와
+      20d 수익률로 구분해 명시할 것. 그 진영 안에서 홀로 오른 예외 종목이 있으면 이유와 함께 짚는다.
 
-  ⑤메가캡의 그늘과 개별 드라마 — 위 3블록을 모두 채운 뒤에만, 짧게. 시총 상위 종목 중
-    크게 움직인 종목의 개별 스토리(경영진 교체, 신제품 실망, 실적 등)와, 섹터 흐름과
-    무관하게 자기만의 이유(규제 이슈, 가이던스 쇼크, M&A, 밈주 수급)로 급등락한 종목
-    2~3개를 회사명+티커+등락률+이유로 서술.
-  ⑥투자 관점 해석(시장 분위기/섹터 상대강도/매크로/대중 기대감/한국시장 함의 1줄).
+  ⑤추세·상대강도 스코어보드 — ④를 모두 채운 뒤, 표가 아닌 6~10줄의 압축 목록으로:
+    · 20일 RS 상위 3섹터와 하위 3섹터(각각 순위 변화를 ↑n/↓n로 함께)
+    · 5일 사이 RS 순위가 가장 크게 오른 섹터와 가장 크게 내린 섹터 각 1개 + 그 의미 한 줄
+    · watchlist_momentum_leaders에서 3종목, watchlist_momentum_laggards에서 3종목
+      (회사명(티커) 20d 수익률 · RS)
+    · market_breadth 요약 한 줄 — 50일선 위 n/N, 200일선 위 n/N, 52주 고점 3% 이내 n종목
+    · watchlist_volume_surges 중 거래량 2배 이상인 종목과 그것이 뜻하는 바 한 줄
+      (거래량 없는 상승은 신뢰도가 낮다는 관점을 포함)
+  ⑥메가캡의 그늘과 개별 드라마 — 위를 모두 채운 뒤에만, 짧게. 시총 상위 종목 중 크게 움직인
+    종목의 개별 스토리(경영진 교체, 신제품 실망, 실적 등)와, 섹터 흐름과 무관하게 자기만의
+    이유(규제 이슈, 가이던스 쇼크, M&A, 밈주 수급)로 급등락한 종목 2~3개를
+    회사명+티커+등락률+이유로 서술.
+  ⑦투자 관점 해석 — 시장 분위기 / 섹터 상대강도(자금이 어느 섹터에서 어느 섹터로 옮겨가는
+    중인지 RS 순위 변화를 근거로 명시) / 매크로 / 대중 기대감 / 한국시장 함의 1줄.
+    마지막에 추세추종 관점으로 '지금 추세가 살아 있는 진영'과 '추세가 꺾인 진영'을
+    각각 한 문장씩 구분해 줄 것.
 - 웹검색이 가능하면 급등락 '이유'(실적, 뉴스, 지표)를 확인해 서사에 녹일 것. 확인 안 되는
   이유는 추정하지 말고 수치만 기술.
-- 제공된 수치를 임의로 바꾸지 말 것. 없는 수치는 만들지 말 것.
+- 제공된 수치를 임의로 바꾸지 말 것. 없는 수치는 만들지 말 것. 데이터에 없는 필드(이력 부족으로
+  빠진 항목)는 언급하지 말고 있는 지표로만 판단할 것.
 - 마지막에 '투자 권유가 아닌 정보 제공 목적' 1줄.
-- ④의 3블록에 지면을 가장 많이 쓸 것. ①②③⑤⑥이 길어져 ④가 밀리면 실패한 브리핑이다.
-- 전체 길이는 텔레그램 2~4개 메시지 이내(약 8,000자 이내)."""
+- ④의 3블록에 지면을 가장 많이 쓸 것. ⑤는 압축적으로. ①②③⑥⑦이 길어져 ④가 밀리면 실패한 브리핑이다.
+- 전체 길이는 텔레그램 3~5개 메시지 이내(약 10,000자 이내)."""
 
 
 def build_brief_with_claude(data):
@@ -413,7 +657,7 @@ def build_brief_with_claude(data):
         tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
     body = {
         "model": model,
-        "max_tokens": int(os.environ.get("CLAUDE_MAX_TOKENS", "12000")),
+        "max_tokens": int(os.environ.get("CLAUDE_MAX_TOKENS", "14000")),
         "system": SYSTEM_PROMPT,
         "messages": [{
             "role": "user",
@@ -459,42 +703,110 @@ def build_brief_with_claude(data):
     return text or None
 
 
+def _fmt_trend(m):
+    """폴백 브리핑에서 종목 한 줄 뒤에 붙일 추세 꼬리표. 없는 지표는 조용히 생략한다."""
+    bits = []
+    if m.get("ret_20d") is not None:
+        bits.append(f"20d {m['ret_20d']:+.2f}%")
+    if m.get("vs_ma200") is not None:
+        bits.append(f"200일선 {m['vs_ma200']:+.1f}%")
+    if m.get("rs_20d_vs_spx") is not None:
+        bits.append(f"RS {m['rs_20d_vs_spx']:+.2f}%p")
+    if m.get("vol_x_avg20") is not None:
+        bits.append(f"거래량 {m['vol_x_avg20']:.1f}배")
+    return f"  <i>{' · '.join(bits)}</i>" if bits else ""
+
+
+def _rank_arrow(s):
+    """RS 순위 변화를 ↑n/↓n로. 변화가 없거나 값이 없으면 빈 문자열."""
+    d = s.get("rs_rank_change_5d")
+    if not d:
+        return ""
+    return f" {'↑' if d > 0 else '↓'}{abs(d)}"
+
+
 def build_fallback_brief(data):
     """API 키가 없거나 실패했을 때의 수치 위주 브리핑."""
     L = [f"📊 <b>미국 시장 브리핑 — {data['session_date']} (현지 마감)</b>", ""]
-    L.append("<b>② 핵심 지표</b>")
+    L.append("<b>② 핵심 지표</b> <i>(전일 / 20일 / 연초)</i>")
     for r in data["indicators"]:
         if "error" in r:
             L.append(f"· {r['name']}: N/A")
-        elif r["ticker"] == "^TNX":
+            continue
+        if r["ticker"] == "^TNX":
+            d20 = f"{r['chg_bp_20d']:+.1f}bp" if r.get("chg_bp_20d") is not None else "N/A"
             ytd = f"{r['chg_bp_ytd']:+.1f}bp" if r.get("chg_bp_ytd") is not None else "N/A"
-            L.append(f"· {r['name']}: {r['close']:.3f}%  전일 {r.get('chg_bp_d', 0):+.1f}bp / 연초 {ytd}")
+            L.append(f"· {r['name']}: {r['close']:.3f}%  {r.get('chg_bp_d', 0):+.1f}bp / {d20} / {ytd}")
         else:
+            d20 = f"{r['ret_20d']:+.2f}%" if r.get("ret_20d") is not None else "N/A"
             ytd = f"{r['chg_pct_ytd']:+.2f}%" if r.get("chg_pct_ytd") is not None else "N/A"
-            L.append(f"· {r['name']}: {r['close']:,.2f}  전일 {r.get('chg_pct_d', 0):+.2f}% / 연초 {ytd}")
+            ma = f"  <i>200일선 {r['vs_ma200']:+.1f}%</i>" if r.get("vs_ma200") is not None else ""
+            L.append(f"· {r['name']}: {r['close']:,.2f}  {r.get('chg_pct_d', 0):+.2f}% / {d20} / {ytd}{ma}")
     L.append("")
-    L.append("<b>섹터 일일 등락(상위→하위)</b>")
+
+    b = data.get("market_breadth")
+    if b:
+        L.append("<b>시장 폭(워치리스트 기준)</b>")
+        L.append(f"· 상승 {b['advancers']} / 하락 {b['decliners']} (전체 {b['universe']})")
+        L.append(f"· 50일선 위 {b['above_ma50']}/{b['above_ma50_of']} · "
+                 f"200일선 위 {b['above_ma200']}/{b['above_ma200_of']}")
+        L.append(f"· 52주 고점 3% 이내 {len(b['within_3pct_of_52w_high'])}종목 · "
+                 f"52주 저점 10% 이내 {len(b['within_10pct_of_52w_low'])}종목")
+        L.append("")
+
+    L.append("<b>섹터 일일 등락 / 20일 상대강도</b>")
     for s in data["sectors_by_daily_change"]:
-        L.append(f"· {s['name']}: {s['chg_pct_d']:+.2f}%")
+        rs = f"RS {s['rs_20d_vs_spx']:+.2f}%p" if s.get("rs_20d_vs_spx") is not None else "RS N/A"
+        rank = f", {s['rs_rank_20d']}위{_rank_arrow(s)}" if s.get("rs_rank_20d") else ""
+        L.append(f"· {s['name']}: {s['chg_pct_d']:+.2f}%  <i>({rs}{rank})</i>")
     L.append("")
+
     L.append("<b>③ 나스닥 시총 상위 10</b>")
     for i, m in enumerate(data["nasdaq_top10_by_mcap"], 1):
         cap = f"${m['market_cap']/1e12:.2f}T" if m["market_cap"] >= 1e12 else f"${m['market_cap']/1e9:.0f}B"
-        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%  <i>{cap}</i>")
+        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%"
+                 f"  <i>{cap}</i>{_fmt_trend(m)}")
     L.append("")
+
     if data.get("watchlist_group_performance"):
-        L.append("<b>테마별 평균 등락(워치리스트)</b>")
+        L.append("<b>테마별 오늘 / 20일 평균(워치리스트)</b>")
         for g in data["watchlist_group_performance"]:
-            L.append(f"· {g['group']}: {g['avg_chg_pct_d']:+.2f}% (상승 {g['up']} / 하락 {g['down']})")
+            d20 = f"{g['avg_ret_20d']:+.2f}%" if g.get("avg_ret_20d") is not None else "N/A"
+            ma = (f", 50일선 위 {g['above_ma50']}/{g['above_ma50_of']}"
+                  if g.get("above_ma50_of") else "")
+            L.append(f"· {g['group']}: {g['avg_chg_pct_d']:+.2f}% / 20d {d20}"
+                     f"  <i>(상승 {g['up']}/하락 {g['down']}{ma})</i>")
         L.append("")
+
     L.append("<b>④ 워치리스트 급등 Top 10</b> <i>(대형주 워치리스트 기준)</i>")
     for i, m in enumerate(data["watchlist_top_gainers"], 1):
-        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%")
+        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%{_fmt_trend(m)}")
     L.append("")
     L.append("<b>급락 Top 10</b>")
     for i, m in enumerate(data["watchlist_top_losers"], 1):
-        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%")
+        L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): {m['chg_pct_d']:+.2f}%{_fmt_trend(m)}")
     L.append("")
+
+    if data.get("watchlist_momentum_leaders"):
+        L.append("<b>⑤ 20일 추세 상위</b>")
+        for i, m in enumerate(data["watchlist_momentum_leaders"], 1):
+            L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): "
+                     f"20d {m['ret_20d']:+.2f}%  <i>오늘 {m['chg_pct_d']:+.2f}%</i>")
+        L.append("")
+        L.append("<b>20일 추세 하위</b>")
+        for i, m in enumerate(data["watchlist_momentum_laggards"], 1):
+            L.append(f"{i}. {m.get('name', m['ticker'])} ({m['ticker']}): "
+                     f"20d {m['ret_20d']:+.2f}%  <i>오늘 {m['chg_pct_d']:+.2f}%</i>")
+        L.append("")
+
+    surges = [m for m in data.get("watchlist_volume_surges", []) if m.get("vol_x_avg20", 0) >= 2]
+    if surges:
+        L.append("<b>거래량 급증(20일 평균 2배 이상)</b>")
+        for m in surges:
+            L.append(f"· {m.get('name', m['ticker'])} ({m['ticker']}): "
+                     f"{m['vol_x_avg20']:.1f}배  {m['chg_pct_d']:+.2f}%")
+        L.append("")
+
     L.append("<i>본 내용은 투자 권유가 아닌 정보 제공 목적입니다.</i>")
     return "\n".join(L)
 
