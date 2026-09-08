@@ -2,3 +2,4 @@
 # yfinance는 0.2 -> 1.x 로 메이저가 바뀐 이력이 있어 상한을 둔다.
 yfinance>=1.7,<2
 requests>=2.34,<3
+lxml>=5,<7
