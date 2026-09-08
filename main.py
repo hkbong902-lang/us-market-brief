@@ -730,7 +730,13 @@ def _call_claude(api_key, body):
     return {"content": content, "stop_reason": stop_reason}
 
 
-def build_brief_with_claude(data):
+def run_claude_brief(system_prompt, user_text, max_uses=5, default_max_tokens="32000"):
+    """system_prompt + user_text로 브리핑 본문을 만들어 돌려준다(실패/키없음이면 None).
+
+    미국 브리핑과 한국 브리핑(kr_main.py)이 같은 호출 경로를 쓰기 위한 공용 진입점이다.
+    스트리밍·이어쓰기·검색 안내멘트 제거는 실패를 겪으며 다듬어진 로직이라 브리핑마다
+    복제하면 이후 수정이 한쪽에만 반영된다. 프롬프트만 갈아끼우고 경로는 하나로 둔다.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
@@ -742,17 +748,10 @@ def build_brief_with_claude(data):
         tools = [{
             "type": os.environ.get("WEB_SEARCH_TOOL_TYPE", "web_search_20260209"),
             "name": "web_search",
-            "max_uses": 5,
+            "max_uses": max_uses,
         }]
 
-    user_turn = {
-        "role": "user",
-        "content": (
-            f"기준 세션: {data['session_date']} (직전 세션 {data['prev_session_date']}).\n"
-            "아래 실측 데이터로 브리핑을 작성해 주세요.\n\n"
-            + json.dumps(data, ensure_ascii=False)
-        ),
-    }
+    user_turn = {"role": "user", "content": user_text}
     body = {
         "model": model,
         # max_tokens는 '본문 길이'가 아니라 한 응답이 생성하는 모든 토큰의 상한이다.
@@ -761,8 +760,8 @@ def build_brief_with_claude(data):
         # 게다가 한국어는 글자당 1.5~2토큰이라 '1만 자'는 1.5만~2만 토큰이다.
         # 이 셋을 한 예산에 넣고 1.4만으로 잡았더니 사고와 검색이 먼저 예산을 쓰고
         # 브리핑은 ①만 나온 채 잘렸다. 상한일 뿐 실제 생성량만 과금된다.
-        "max_tokens": int(os.environ.get("CLAUDE_MAX_TOKENS", "32000")),
-        "system": SYSTEM_PROMPT,
+        "max_tokens": int(os.environ.get("CLAUDE_MAX_TOKENS", default_max_tokens)),
+        "system": system_prompt,
         "messages": [user_turn],
     }
     if tools:
@@ -800,6 +799,15 @@ def build_brief_with_claude(data):
 
     # 이어쓰기 조각은 문장 중간에서 갈라진 것이므로 구분자 없이 그대로 붙인다.
     return "".join(parts).strip() or None
+
+
+def build_brief_with_claude(data):
+    return run_claude_brief(
+        SYSTEM_PROMPT,
+        f"기준 세션: {data['session_date']} (직전 세션 {data['prev_session_date']}).\n"
+        "아래 실측 데이터로 브리핑을 작성해 주세요.\n\n"
+        + json.dumps(data, ensure_ascii=False),
+    )
 
 
 def _fmt_trend(m):

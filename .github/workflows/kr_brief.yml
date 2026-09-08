@@ -1,0 +1,41 @@
+name: KR Market Daily Brief
+
+on:
+  schedule:
+    # UTC 08:30 (월~금) = 한국시간 17:30. KRX 정규장 마감은 15:30 KST이므로 2시간 여유를 둔다.
+    # 야후 일봉이 마감 직후 즉시 확정되지 않는 경우가 있어, 짧게 잡으면 전일 봉을 최신으로
+    # 읽고 "휴장"으로 오판할 수 있다. Actions 크론 자체 지연(수~수십 분)도 이 여유로 흡수한다.
+    - cron: "30 8 * * 1-5"
+  workflow_dispatch:      # 수동 실행(테스트용)
+    inputs:
+      force_send:
+        description: "휴장(주말·공휴일)이어도 직전 마감 세션 브리핑을 강제 발송"
+        type: boolean
+        default: false
+
+jobs:
+  send-kr-brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build & send KR brief
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # 수동 실행에서 체크했을 때만 "1". 스케줄 실행에서는 inputs가 없어 항상 "0".
+          FORCE_SEND: ${{ inputs.force_send && '1' || '0' }}
+          # 종목마다 '왜 움직였는가' 1줄을 붙이는 구성이라 미국편(5회)보다 검색을 더 쓴다.
+          KR_WEB_SEARCH_MAX_USES: "10"
+          # CLAUDE_MODEL: claude-sonnet-5
+          # USE_WEB_SEARCH: "1"
+        run: python kr_main.py
