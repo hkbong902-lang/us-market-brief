@@ -22,7 +22,7 @@ on:
 jobs:
   send-brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
 

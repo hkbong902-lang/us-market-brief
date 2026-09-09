@@ -20,6 +20,7 @@ US Market Daily Brief -> Telegram
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -342,23 +343,71 @@ def latest_session_info(closes_gspc):
     return t_date, t1_date
 
 
+# 지수와 종목은 서로 다른 다운로드로 받으므로 같은 시점의 데이터라는 보장이 없다.
+# 실제로 지수는 T 세션, 종목은 T-1 세션인 채로 브리핑이 발송된 적이 있다(2026-09-08):
+# 지수 등락률은 09-08, 개별 종목 등락률은 전부 09-04였고, 서사의 대부분이 다른 날
+# 이야기였다. 어긋남은 예외를 던지지 않는다 — 각 시계열은 자기 마지막 봉으로 정상
+# 계산되고, 결과물은 올바른 브리핑과 똑같은 모습을 한다. 그래서 검사가 필요하다.
+ALIGN_MAX_WAIT_MIN = int(os.environ.get("ALIGN_MAX_WAIT_MIN", "35"))
+ALIGN_POLL_SEC = int(os.environ.get("ALIGN_POLL_SEC", "120"))
+ALIGN_MIN_RATIO = float(os.environ.get("ALIGN_MIN_RATIO", "0.9"))
+
+
+def _last_date(series):
+    return series.index[-1].date()
+
+
+def fetch_aligned(start, equities):
+    """지수와 종목을 같은 세션으로 맞춰 받는다. 맞을 때까지 기다렸다 다시 받는다.
+
+    상장폐지·거래정지 등으로 개별 종목 몇 개가 뒤처지는 것은 정상이므로 비율로 본다.
+    대다수가 뒤처져 있으면 데이터가 아직 안 올라온 것이니 기다린다. 끝내 맞지 않으면
+    틀린 브리핑을 보내느니 예외를 올린다 — 조용히 섞인 브리핑은 정상과 구분되지 않아
+    독자가 잘못된 수치를 사실로 읽게 된다.
+    """
+    deadline = time.time() + ALIGN_MAX_WAIT_MIN * 60
+    attempt = 0
+    while True:
+        attempt += 1
+        idx = download_history(list(INDICES.keys()), start=start)
+        if BENCHMARK not in idx or len(idx[BENCHMARK]["close"]) < 2:
+            raise RuntimeError("지수 데이터 수집 실패(^GSPC)")
+        bench_close = idx[BENCHMARK]["close"]
+        t_date = _last_date(bench_close)
+
+        hist = download_history(equities, start=start)
+        usable = {t: h for t, h in hist.items() if len(h["close"]) >= 2}
+        aligned = {t: h for t, h in usable.items() if _last_date(h["close"]) == t_date}
+        stale = sorted(set(usable) - set(aligned))
+        ratio = (len(aligned) / len(usable)) if usable else 0.0
+        print(f"정합성 점검 {attempt}회차: 기준 세션 {t_date}, "
+              f"종목 {len(aligned)}/{len(usable)} 정렬({ratio:.0%})"
+              + (f", 뒤처진 종목 {len(stale)}개" if stale else ""), file=sys.stderr)
+
+        if usable and ratio >= ALIGN_MIN_RATIO:
+            if stale:
+                print(f"  뒤처져 제외: {', '.join(stale[:10])}"
+                      + (" …" if len(stale) > 10 else ""), file=sys.stderr)
+            return idx, bench_close, t_date, aligned, stale, attempt
+
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"지수는 {t_date} 세션인데 종목 시세 {len(usable) - len(aligned)}/{len(usable)}개가 "
+                f"이전 세션에 머물러 있습니다({ALIGN_MAX_WAIT_MIN}분 대기 후에도 해소되지 않음). "
+                "서로 다른 날짜를 섞은 브리핑을 보내지 않기 위해 중단합니다.")
+        time.sleep(ALIGN_POLL_SEC)
+
+
 def collect_market_data():
     now_et = datetime.now(ET)
     year = now_et.year
     start = (now_et - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
 
-    # 1) 지수/금리/유가 — 같은 시계열에서 전년말 종가와 추세 지표를 동시에 뽑는다.
-    idx = download_history(list(INDICES.keys()), start=start)
-    if BENCHMARK not in idx or len(idx[BENCHMARK]["close"]) < 2:
-        raise RuntimeError("지수 데이터 수집 실패(^GSPC)")
-
-    bench_close = idx[BENCHMARK]["close"]
-    t_date, t1_date = latest_session_info(bench_close)
-    bench = trend_metrics(bench_close)
-
-    # 주식류(섹터 ETF·메가캡 후보·워치리스트)는 중복을 없애 한 번에 받는다.
+    # 1) 지수와 종목을 같은 세션으로 정렬해 받는다(위 fetch_aligned 주석 참고).
     equities = sorted(set(MOVER_WATCHLIST) | set(NASDAQ_MEGACAP_CANDIDATES) | set(SECTOR_ETFS))
-    hist = download_history(equities, start=start)
+    idx, bench_close, t_date, hist, stale_tickers, align_attempts = fetch_aligned(start, equities)
+    t1_date = latest_session_info(bench_close)[1]
+    bench = trend_metrics(bench_close)
     metrics = {
         t: trend_metrics(h["close"], h.get("volume"))
         for t, h in hist.items() if len(h["close"]) >= 2
@@ -397,6 +446,9 @@ def collect_market_data():
         row["vs_ma50"] = m.get("vs_ma50")
         row["vs_ma200"] = m.get("vs_ma200")
         row["pct_from_52w_high"] = m.get("pct_from_52w_high")
+        # 지수끼리도 갱신 시점이 다를 수 있다. 기준 세션과 다르면 숨기지 말고 밝힌다.
+        if _last_date(s) != t_date:
+            row["as_of"] = str(_last_date(s))
         indicators.append(strip_none(row))
 
     # 2) 섹터 ETF — 1일 등락에 다기간 수익률·RS·이동평균 위치·RS 순위 변화를 더한다.
@@ -528,6 +580,13 @@ def collect_market_data():
     return {
         "session_date": str(t_date),
         "prev_session_date": str(t1_date),
+        "data_alignment": strip_none({
+            "aligned_tickers": len(metrics),
+            "excluded_stale_tickers": stale_tickers or None,
+            "fetch_attempts": align_attempts,
+            "note": ("모든 종목 수치는 session_date 세션 기준으로 정렬되어 있다. "
+                     "이전 세션에 머물러 있던 종목은 집계에서 제외했다."),
+        }),
         "benchmark": strip_none({"ticker": BENCHMARK, "name": "S&P500(상대강도 기준)", **bench}),
         "indicators": indicators,
         "sectors_by_daily_change": sectors,
@@ -987,7 +1046,18 @@ def main():
     now_kst = datetime.now(KST)
     print(f"run at ET={now_et:%Y-%m-%d %H:%M} / KST={now_kst:%Y-%m-%d %H:%M}")
 
-    data = collect_market_data()
+    try:
+        data = collect_market_data()
+    except Exception as e:
+        # 수집 실패를 조용히 넘기지 않는다. 브리핑이 안 오는 것과 잘못된 브리핑이 오는 것
+        # 중에서는 전자가 낫지만, 아무 소식도 없는 것이 가장 나쁘다.
+        print(f"수집 실패: {e}", file=sys.stderr)
+        try:
+            send_telegram(f"🇺🇸 <b>미국 브리핑 생성 실패</b>\n<i>{e}</i>")
+        except Exception:
+            pass
+        raise
+
     session = datetime.strptime(data["session_date"], "%Y-%m-%d").date()
 
     # 아침 7시(KST) 실행 시, 마감된 세션은 'ET 기준 오늘' 날짜여야 함.
