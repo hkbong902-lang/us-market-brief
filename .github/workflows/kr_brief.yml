@@ -32,7 +32,9 @@ on:
 jobs:
   send-kr-brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 2026-09-10 실측 12m26s. 검색을 10회까지 쓰는 구성이라 날에 따라 더 걸린다.
+    # 15분이면 여유가 2분 30초뿐이고, 넘기면 브리핑이 통째로 누락된다.
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read          # 오늘 이미 성공한 실행이 있는지 조회하기 위해 필요
