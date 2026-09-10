@@ -1,12 +1,28 @@
 name: KR Market Daily Brief
 
+# 트리거는 두 겹이다. 정시성은 로컬 스케줄러가, 최소 보장은 크론이 맡는다.
+# (미국편 daily_brief.yml 과 동일한 구조 — 한쪽만 바꾸지 말 것.)
+#
+# 1) 정시 경로(주 경로): 로컬 PC의 작업 스케줄러가 월~금 17:35 KST 에
+#    workflow_dispatch 를 호출한다(scripts/setup-dispatch.ps1). 수동 실행은 대기열을
+#    타지 않아 몇 초 안에 시작한다.
+#
+# 2) 백업 경로: 아래 크론. on.schedule 은 실행 시각을 보장하지 않는다. 이 워크플로의
+#    실측은 2026-09-09 에 273분 지연(17:30 예정 → 22:03 도착), 2026-09-10 에는 아예
+#    미발화였다. 마감은 못 지키지만 '아무것도 오지 않는 날'은 막는다.
+#
+# 두 경로가 같은 날 겹치지 않도록, 크론으로 들어온 실행은 아래 guard 스텝에서
+# '오늘 이미 성공한 실행이 있는지' 확인하고 있으면 스스로 종료한다.
+# ★ 그래서 크론은 반드시 정시 경로보다 '뒤' 시각이어야 한다. 앞에 두면 가드가 볼
+#   성공 실행이 아직 없어 무력해지고, 같은 날 브리핑이 두 번 발송된다.
 on:
   schedule:
-    # UTC 08:30 (월~금) = 한국시간 17:30. KRX 정규장 마감은 15:30 KST이므로 2시간 여유를 둔다.
-    # 야후 일봉이 마감 직후 즉시 확정되지 않는 경우가 있어, 짧게 잡으면 전일 봉을 최신으로
-    # 읽고 "휴장"으로 오판할 수 있다. Actions 크론 자체 지연(수~수십 분)도 이 여유로 흡수한다.
-    - cron: "30 8 * * 1-5"
-  workflow_dispatch:      # 수동 실행(테스트용)
+    # UTC 10:00 (월~금) = 한국시간 19:00. 정시 경로(17:35)보다 뒤에 두어, 정시 경로가
+    # 성공한 날에는 guard 가 이 실행을 걸러내도록 한다.
+    # KRX 정규장 마감은 15:30 KST. 야후 일봉이 마감 직후 즉시 확정되지 않는 경우가
+    # 있어 여유가 필요한데, 19:00 은 그 조건도 함께 만족한다.
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch:      # 정시 경로(로컬 스케줄러) 및 수동 테스트
     inputs:
       force_send:
         description: "휴장(주말·공휴일)이어도 직전 마감 세션 브리핑을 강제 발송"
@@ -17,17 +33,47 @@ jobs:
   send-kr-brief:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read          # 오늘 이미 성공한 실행이 있는지 조회하기 위해 필요
     steps:
+      # 백업 크론이 정시 경로와 겹쳐 브리핑을 두 번 보내는 것을 막는다.
+      # 수동 실행(workflow_dispatch)은 사람이 의도한 것이므로 거르지 않는다.
+      - name: 중복 발송 가드 (크론 실행에만 적용)
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          since=$(date -u +%Y-%m-%dT00:00:00Z)
+          runs=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/kr_brief.yml/runs?per_page=20&status=success&created=>=${since}")
+          # 자기 자신은 아직 success 가 아니므로 집계에 잡히지 않는다.
+          count=$(printf '%s' "$runs" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workflow_runs",[])))')
+          echo "오늘(UTC $since 이후) 성공한 실행: ${count}건"
+          if [ "$count" -gt 0 ]; then
+            echo "정시 경로가 이미 브리핑을 보냈습니다 → 백업 크론 실행을 건너뜁니다."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        id: guard
+
       - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
       - name: Build & send KR brief
+        if: steps.guard.outputs.skip != 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
