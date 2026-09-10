@@ -51,12 +51,22 @@ if (-not (Test-Path $TokenFile)) {
 }
 
 try {
-    $secure = Get-Content $TokenFile -Raw | ConvertTo-SecureString
+    # ★ .Trim() 필수 (2026-09-11 실측)
+    #   setup-dispatch.ps1 은 Set-Content 로 저장하므로 파일 끝에 항상 개행이 붙는다.
+    #   -Raw 는 그 개행까지 읽어오고, ConvertTo-SecureString 은 16진 문자열만 받으므로
+    #   "Input string was not in a correct format" 으로 죽는다. DPAPI 나 LogonType 과는
+    #   무관한, 순전히 읽기 방식의 문제다. 되돌리지 말 것.
+    $secure = (Get-Content $TokenFile -Raw).Trim() | ConvertTo-SecureString
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     $token = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 } catch {
-    Write-Log "실패: 토큰 복호화 불가. 다른 사용자/PC에서 만든 파일일 수 있습니다. setup-dispatch.ps1 재실행 필요."
+    # 원인을 단정하지 않는다. 예전에는 "다른 사용자/PC에서 만든 파일"이라고 단정하고
+    # setup-dispatch.ps1 재실행을 처방했는데, 실제 원인이 파일 형식 문제였을 때는
+    # 재실행해도 같은 파일이 다시 만들어져 고쳐지지 않는다. 예외 메시지를 그대로 남긴다.
+    Write-Log "실패: 토큰 복호화 불가 — $($_.Exception.Message)"
+    Write-Log "  → 다른 사용자/PC에서 만든 파일이면 setup-dispatch.ps1 을 재실행하세요."
+    Write-Log "  → 'not in a correct format' 이면 파일 내용/형식 문제이며 재실행으로 고쳐지지 않습니다."
     exit 1
 }
 

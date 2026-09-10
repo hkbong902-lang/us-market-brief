@@ -40,7 +40,9 @@ param(
     [switch]$SkipToken,
     # 예전 동작(로그온 상태에서만 실행)으로 등록한다. Windows 암호를 저장할 수 없는
     # 계정(PIN 전용 등)에서만 쓴다.
-    [switch]$Interactive
+    [switch]$Interactive,
+    # 토큰 검증에 쓴다.
+    [string]$Repo = "hkbong902-lang/us-market-brief"
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,11 +54,53 @@ $tokenFile = Join-Path $env:USERPROFILE ".us-market-brief\gh-token.txt"
 
 # ── 1) 토큰 저장 (두 작업이 같은 토큰을 쓴다) ────────────────────────────────
 if (-not $SkipToken) {
+    # ★ 안내문과 입력 프롬프트를 분리한다 (2026-09-11 사고).
+    #   안내를 프롬프트에 붙여 두면 안내문 자체가 값으로 붙여넣어진다. 실제로 발생했고,
+    #   입력이 화면에 표시되지 않아 그 자리에서는 드러나지 않은 채 저장됐다.
     Write-Host ""
-    Write-Host "GitHub fine-grained token 을 붙여넣으세요 (화면에 표시되지 않습니다)."
-    Write-Host "  필요 권한: Actions = Read and write / 대상: hkbong902-lang/us-market-brief"
-    $secure = Read-Host -AsSecureString "Token"
+    Write-Host "GitHub fine-grained token 이 필요합니다." -ForegroundColor Cyan
+    Write-Host "  발급 : https://github.com/settings/personal-access-tokens"
+    Write-Host "  대상 : $Repo"
+    Write-Host "  권한 : Actions = Read and write"
+    Write-Host ""
+    Write-Host "아래에는 토큰 값만 붙여넣으십시오 — 위 안내문이 아닙니다." -ForegroundColor Yellow
+    Write-Host "(github_pat_ 로 시작하는 한 줄. 화면에는 표시되지 않습니다.)" -ForegroundColor Yellow
+    $secure = Read-Host -AsSecureString "github_pat_..."
     if ($secure.Length -eq 0) { throw "토큰이 비어 있습니다." }
+
+    # ★ 저장 전에 검증한다 (2026-09-11 사고).
+    #   검증하지 않으면 잘못된 값이 조용히 저장되고, 다음 정시 실행에서야 실패가
+    #   드러난다. 그 사이 브리핑 하루가 통째로 날아간다. 형식 검사만으로는 부족해
+    #   실제 API 호출까지 한다 — 만료·권한 부족도 여기서 걸린다.
+    $bstrT = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try   { $plainTok = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstrT) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstrT) }
+
+    if ($plainTok -match "\s") {
+        throw "토큰에 공백이나 줄바꿈이 들어 있습니다. 안내문을 붙여넣지 않았는지 확인하세요. 저장하지 않았습니다."
+    }
+    if ($plainTok -notmatch "^(github_pat_|ghp_|gho_|ghs_)") {
+        throw "토큰 형식이 아닙니다(github_pat_ 또는 ghp_ 로 시작해야 합니다). 저장하지 않았습니다."
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $hdrT = @{
+        Authorization          = "Bearer $plainTok"
+        Accept                 = "application/vnd.github+json"
+        "User-Agent"           = "us-market-brief-dispatcher"
+        "X-GitHub-Api-Version" = "2022-11-28"
+    }
+    try {
+        $null = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/actions/workflows" `
+            -Headers $hdrT -TimeoutSec 30
+        Write-Host "토큰 확인 완료: $Repo 의 Actions 에 접근됩니다." -ForegroundColor Green
+    } catch {
+        $plainTok = $null
+        throw ("토큰이 거부되었습니다: $($_.Exception.Message)`n" +
+               "  401 이면 토큰 값이 잘못되었거나 만료된 것이고, 404 면 Repository access 가 $Repo 를 포함하지 않은 것입니다.`n" +
+               "  저장하지 않았습니다. 토큰을 다시 확인해 이 스크립트를 재실행하세요.")
+    }
+    $plainTok = $null
 
     $dir = Split-Path $tokenFile -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
