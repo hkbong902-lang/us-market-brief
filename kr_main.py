@@ -11,23 +11,18 @@
 
 종목 유니버스를 손으로 고르지 않는다. '상승률 상위 10'과 '가장 강한 업종'은 시장 전체를
 봐야만 답할 수 있는 질문이고, 손으로 고른 리스트로 답하면 '내가 고른 것 중 1위'가 나오면서
-겉모습은 정답과 똑같다. 그래서 네이버 금융의 등락률 순위·업종 시세를 그대로 받아 쓴다
-(코스피 789 / 코스닥 506 종목, 업종 79개 기준). 추세 지표(20일·200일선)만 선정된
-종목에 한해 yfinance로 덧붙인다.
+겉모습은 정답과 똑같다. 그래서 네이버 금융 모바일 JSON API 에서 시장 전체의 등락률 순위와 업종 시세를 그대로
+받아 쓴다. 추세 지표(20일·200일선)만 선정된 종목에 한해 yfinance 로 덧붙인다.
 
 수집 실패는 조용히 넘기지 않는다. 부분 브리핑은 정상 브리핑과 겉모습이 같아서, 장애가
 '기능이 좀 빠진 것'으로 읽히고 원인 조사가 늦어진다.
 """
-import io
 import json
 import os
-import re
 import sys
 from datetime import datetime, timedelta
 
-import pandas as pd
 import requests
-import yfinance as yf
 
 from main import (
     KST,
@@ -46,50 +41,43 @@ KR_INDICES = {
 }
 BENCHMARK_KR = "^KS11"
 
-NAVER = "https://finance.naver.com"
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+# 네이버 금융의 HTML 순위·업종 페이지는 2026-09-10 시점에 표가 사라졌다(HTTP 200 이지만
+# <table> 0개). pandas.read_html 은 lxml 로 표를 못 찾자 bs4/html5lib 경로로 넘어가
+# "Import html5lib failed" 로 죽었는데, 그 메시지는 증상일 뿐 원인은 소스가 바뀐 것이다.
+#
+# 그래서 모바일 JSON API 로 옮긴다. HTML 파싱보다 나은 것이 표 유무만이 아니다.
+#  - itemCode 가 stockName 과 같은 객체에 들어 있다 → 순번으로 코드를 짝지을 일이 없다
+#    (HTML 시절 액스비스에 광전자의 코드가 붙던 부류의 오류가 구조적으로 불가능해진다).
+#  - stockExchangeType.code 가 KS/KQ 를 알려준다 → 접미사를 추측하지 않는다.
+#  - localTradedAt / marketStatus 가 기준 시각과 장 상태를 준다 → 세션 날짜를 다른 소스에서
+#    빌려오지 않는다.
+NAVER_API = "https://m.stock.naver.com/api"
+UA = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+    "Referer": "https://m.stock.naver.com/",
+}
 TOP_N = int(os.environ.get("KR_TOP_N", "10"))
 # 상승률 상위는 상한가 소형주가 대부분을 차지한다. 그 자체가 그날의 사실이므로 기본값은
 # 필터 없음(0)이다. 대형주 위주로 보고 싶으면 억 단위 하한을 넣는다(예: 5000 = 5,000억).
 MIN_CAP_EOK = int(os.environ.get("KR_MIN_MARKET_CAP_EOK", "0"))
-# 네이버 등락률 순위표에는 ETN·ETF·리츠가 종목과 섞여 실린다. ETN은 지수를 추종하는
-# 상장지수증권이라 '오늘 오른 종목'의 이유를 물을 대상이 아니다(레버리지 배수만큼 오른다).
-# KR_INCLUDE_ETP=1 로 두면 필터를 끈다.
+# ETN·ETF 는 지수를 배수로 추종하는 상품이라 '오늘 오른 이유'를 물을 대상이 아니다.
+# API 가 stockEndType 으로 종류를 알려주므로 이름 정규식으로 추측하지 않는다.
 EXCLUDE_ETP = os.environ.get("KR_INCLUDE_ETP", "0") != "1"
-ETP_PAT = re.compile(r"\bETN\b|\bETF\b|레버리지|인버스|선물\s*ETN")
+STOCK_END_TYPES = {"stock"}          # etf, etn, elw 등은 제외
+PAGE_MAX = 100                       # API 가 허용하는 pageSize 상한(101 이상은 400)
 
 
-def _get(url):
+def _api(path, **params):
+    """모바일 JSON API 호출. 실패는 조용히 빈 값으로 넘기지 않고 예외로 올린다."""
+    q = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"{NAVER_API}/{path}" + (f"?{q}" if q else "")
     r = requests.get(url, headers=UA, timeout=20)
     r.raise_for_status()
-    r.encoding = "euc-kr"
-    return r.text
-
-
-def _tables(html):
-    return pd.read_html(io.StringIO(html))
-
-
-def _code_map(html):
-    """종목명 → 종목코드. 링크 태그 안에서 이름과 코드를 '함께' 뽑는다.
-
-    코드만 따로 훑어 표의 행 순번과 짝지으면, 표 밖의 종목 링크(추천·인기 종목 등)가
-    하나만 섞여도 전체가 한 칸씩 밀린다. 그 결과는 예외가 아니라 '다른 종목의 코드가
-    조용히 붙은 행'이고, 등락률은 네이버 값이라 맞아 보이므로 눈으로는 걸러지지 않는다
-    (실제로 액스비스에 광전자의 코드가 붙었다). 링크 하나에서 이름과 코드를 같이
-    꺼내면 순번이라는 매개가 사라져 이 어긋남 자체가 성립하지 않는다.
-    """
-    out = {}
-    for code, name in re.findall(
-            r'/item/main\.naver\?code=(\d{6})"[^>]*>([^<]+)</a>', html):
-        nm = name.strip().rstrip(" *")
-        if nm and nm not in out:
-            out[nm] = code
-    return out
+    return r.json()
 
 
 def _num(v):
-    """'+23.99%' → 23.99 / '-1.25%' → -1.25. 파싱 불가면 None."""
+    """'+23.99' / '55,700' → float. 파싱 불가면 None."""
     if v is None:
         return None
     s = str(v).replace("%", "").replace(",", "").replace("+", "").strip()
@@ -99,100 +87,97 @@ def _num(v):
         return None
 
 
-def naver_gainers(market):
-    """네이버 등락률 순위에서 시장 전체를 등락률 내림차순으로 받는다."""
-    sosok = 0 if market == "KOSPI" else 1
-    html = _get(f"{NAVER}/sise/sise_rise.naver?sosok={sosok}")
-    cmap = _code_map(html)
-    tbl = None
-    for t in _tables(html):
-        cols = [str(c) for c in t.columns]
-        if any("종목명" in c for c in cols) and any("등락률" in c for c in cols):
-            tbl = t.dropna(how="all").dropna(axis=1, how="all")
-            break
-    if tbl is None:
-        raise RuntimeError(f"네이버 등락률 순위 표를 찾지 못했습니다({market})")
+def _stock_row(x, market=None):
+    """API 종목 객체 → 브리핑용 행. 코드·거래소가 같은 객체에서 나온다."""
+    chg = _num(x.get("fluctuationsRatio"))
+    if chg is None or not x.get("itemCode"):
+        return None
+    ex = (x.get("stockExchangeType") or {}).get("code")
+    return strip_none({
+        "name": (x.get("stockName") or "").strip(),
+        "code": x["itemCode"],
+        "market": market or ("KOSDAQ" if ex == "KQ" else "KOSPI"),
+        "suffix": ".KQ" if ex == "KQ" else ".KS",
+        "chg_pct_d": round(chg, 2),
+        "volume": int(_num(x.get("accumulatedTradingVolume")) or 0) or None,
+        "market_cap_eok": int(_num(x.get("marketValue")) or 0) or None,
+    })
 
-    rows, skipped = [], []
-    for i, (_, r) in enumerate(tbl.iterrows()):
-        chg = _num(r.get("등락률"))
-        name = str(r.get("종목명", "")).strip()
-        if chg is None or not name or name == "nan":
-            continue
-        if EXCLUDE_ETP and ETP_PAT.search(name):
-            skipped.append(name)
-            continue
-        clean = name.rstrip(" *")
-        rows.append({
-            "name": clean,
-            "code": cmap.get(clean),
-            "market": market,
-            "chg_pct_d": round(chg, 2),
-            "volume": int(r["거래량"]) if pd.notna(r.get("거래량")) else None,
-        })
-    if skipped:
-        print(f"{market}: ETN/ETF {len(skipped)}개 제외 → {', '.join(skipped[:5])}",
-              file=sys.stderr)
-    if not rows:
-        raise RuntimeError(f"네이버 등락률 순위가 비어 있습니다({market})")
-    return rows
+
+def naver_index(code):
+    """지수 현재값·등락률·기준 시각. code 는 KOSPI 또는 KOSDAQ."""
+    j = _api(f"index/{code}/basic")
+    return {
+        "close": _num(j.get("closePrice")),
+        "chg_pct_d": _num(j.get("fluctuationsRatio")),
+        "market_status": j.get("marketStatus"),
+        "traded_at": j.get("localTradedAt"),
+    }
+
+
+def naver_gainers(market, want=TOP_N):
+    """당일 상승률 상위. 시장 전체가 모집단이며 API 가 등락률 내림차순으로 준다.
+
+    ETP 와 시총 하한으로 걸러낸 뒤 want 개를 채워야 하므로 넉넉히 받아 자른다.
+    """
+    out, page, universe = [], 1, None
+    while len(out) < want and page <= 5:
+        j = _api(f"stocks/up/{market}", page=page, pageSize=PAGE_MAX)
+        universe = j.get("totalCount", universe)
+        items = j.get("stocks") or []
+        if not items:
+            break
+        for x in items:
+            if EXCLUDE_ETP and x.get("stockEndType") not in STOCK_END_TYPES:
+                continue
+            r = _stock_row(x, market)
+            if not r:
+                continue
+            if MIN_CAP_EOK > 0 and (r.get("market_cap_eok") or 0) < MIN_CAP_EOK:
+                continue
+            out.append(r)
+            if len(out) >= want:
+                break
+        page += 1
+    if not out:
+        raise RuntimeError(f"{market} 상승률 상위를 하나도 받지 못했습니다")
+    return out, universe
 
 
 def naver_sectors():
-    """업종별 당일 등락률. [(no, 업종명, 등락률)] 를 등락률 내림차순으로."""
-    html = _get(f"{NAVER}/sise/sise_group.naver?type=upjong")
-    links = re.findall(
-        r"sise_group_detail\.naver\?type=upjong&no=(\d+)\">([^<]+)</a>", html)
-    chg_by_name = {}
-    for t in _tables(html):
-        cols = [str(c) for c in t.columns]
-        if any("업종명" in c for c in cols):
-            t = t.dropna(how="all")
-            namecol = [c for c in t.columns if "업종명" in str(c)][0]
-            chgcol = [c for c in t.columns if "전일대비" in str(c)][0]
-            for _, r in t.iterrows():
-                v = _num(r[chgcol])
-                if v is not None:
-                    chg_by_name[str(r[namecol]).strip()] = v
-            break
-    out = [(no, nm, chg_by_name[nm]) for no, nm in links if nm in chg_by_name]
-    if not out:
-        raise RuntimeError("네이버 업종 시세를 파싱하지 못했습니다")
-    out.sort(key=lambda x: x[2], reverse=True)
-    return out
+    """업종 전체를 당일 등락률 내림차순으로. [(no, 이름, 등락률, 상승수, 하락수, 종목수)]"""
+    j = _api("stocks/industry", page=1, pageSize=PAGE_MAX)   # 업종은 79개라 한 페이지
+    rows = []
+    for g in j.get("groups") or []:
+        chg = _num(g.get("changeRate"))
+        if chg is None:
+            continue
+        rows.append((g["no"], g["name"], round(chg, 2),
+                     g.get("riseCount", 0), g.get("fallCount", 0), g.get("totalCount", 0)))
+    if not rows:
+        raise RuntimeError("업종 시세를 받지 못했습니다")
+    rows.sort(key=lambda r: r[2], reverse=True)
+    return rows
 
 
 def naver_sector_members(no):
-    """업종 구성종목 전체를 등락률 내림차순으로."""
-    html = _get(f"{NAVER}/sise/sise_group_detail.naver?type=upjong&no={no}")
-    cmap = _code_map(html)
-    tbl = None
-    for t in _tables(html):
-        cols = [str(c) for c in t.columns]
-        if any("종목명" in c for c in cols) and any("등락률" in c for c in cols):
-            tbl = t.dropna(how="all").dropna(axis=1, how="all")
+    """업종 구성종목 전체를 등락률 내림차순으로.
+
+    구성종목이 100개를 넘는 업종이 있는데 pageSize 상한이 100이라 페이징한다.
+    한 페이지만 받고 끝내면 뒤쪽 종목이 통째로 빠지고, 그 업종의 '가장 많이 내린 3종목'이
+    실제 최하위가 아니게 된다 — 결과는 정상적인 모습을 하고 있어서 드러나지 않는다.
+    """
+    rows, page, total = [], 1, None
+    while page <= 10:
+        j = _api(f"stocks/industry/{no}", page=page, pageSize=PAGE_MAX)
+        total = j.get("totalCount", total)
+        items = j.get("stocks") or []
+        rows += [r for r in (_stock_row(x) for x in items) if r]
+        if len(items) < PAGE_MAX or (total is not None and len(rows) >= total):
             break
-    if tbl is None:
-        return []
-    rows = []
-    for _, r in tbl.iterrows():
-        chg = _num(r.get("등락률"))
-        name = str(r.get("종목명", "")).strip()
-        if chg is None or not name or name == "nan":
-            continue
-        # 네이버는 업종 구성종목 중 코스닥 종목에 ' *'를 붙인다.
-        clean = name.rstrip(" *")
-        rows.append({
-            "name": clean,
-            "code": cmap.get(clean),
-            "market": "KOSDAQ" if name.endswith("*") else "KOSPI",
-            "chg_pct_d": round(chg, 2),
-            "volume": int(r["거래량"]) if pd.notna(r.get("거래량")) else None,
-        })
-    missing = [r["name"] for r in rows if not r.get("code")]
-    if missing:
-        print(f"업종 {no}: 코드를 찾지 못한 종목 {len(missing)}개 → "
-              f"{', '.join(missing[:5])}", file=sys.stderr)
+        page += 1
+    if total is not None and len(rows) < total:
+        print(f"업종 {no}: 구성종목 {total}개 중 {len(rows)}개만 받았습니다", file=sys.stderr)
     rows.sort(key=lambda x: x["chg_pct_d"], reverse=True)
     return rows
 
@@ -200,22 +185,21 @@ def naver_sector_members(no):
 def attach_trend(rows, bench):
     """선정된 종목에만 20일·200일선 등 추세 지표를 붙인다.
 
-    거래소 접미사를 확신할 수 없는 종목이 있으므로 .KS/.KQ 양쪽을 한 번에 받아
-    데이터가 있는 쪽을 쓴다. 잘못된 접미사는 예외가 아니라 빈 시계열로 나타나기 때문에,
-    한쪽만 시도하면 지표가 조용히 빠진다.
+    거래소 접미사는 API 가 stockExchangeType 으로 알려주므로 추측하지 않는다.
+    받지 못한 종목은 조용히 넘기지 않고 이름을 남긴다 — 잘못된 심볼은 예외가 아니라
+    빈 시계열로 나타나서, 세지 않으면 지표만 사라지고 아무도 모른다.
     """
-    codes = [r["code"] for r in rows if r.get("code")]
-    if not codes:
+    want = [r for r in rows if r.get("code")]
+    if not want:
         return
     start = (datetime.now(KST) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
-    syms = [c + s for c in codes for s in (".KS", ".KQ")]
+    syms = [r["code"] + r.get("suffix", ".KS") for r in want]
     hist = download_history(syms, start=start)
-    for r in rows:
-        c = r.get("code")
-        if not c:
-            continue
-        h = hist.get(c + ".KS") or hist.get(c + ".KQ")
+    missing = []
+    for r in want:
+        h = hist.get(r["code"] + r.get("suffix", ".KS"))
         if not h or len(h["close"]) < 2:
+            missing.append(f'{r["name"]}({r["code"]})')
             continue
         m = trend_metrics(h["close"], h.get("volume"))
         for k in ("ret_5d", "ret_20d", "vs_ma50", "vs_ma200", "pct_from_52w_high",
@@ -224,102 +208,82 @@ def attach_trend(rows, bench):
                 r[k] = m[k]
         if m.get("ret_20d") is not None and bench.get("ret_20d") is not None:
             r["rs_20d_vs_kospi"] = round(m["ret_20d"] - bench["ret_20d"], 2)
-
-
-def fetch_caps_eok(rows):
-    """시총 하한 필터를 켠 경우에만 쓰는 시가총액(억원) 조회."""
-    import concurrent.futures as cf
-
-    def one(r):
-        c = r.get("code")
-        if not c:
-            return r, None
-        for suf in (".KS", ".KQ"):
-            try:
-                mc = yf.Ticker(c + suf).fast_info.get("marketCap")
-                if mc:
-                    return r, mc / 1e8
-            except Exception:
-                continue
-        return r, None
-
-    with cf.ThreadPoolExecutor(12) as ex:
-        for r, cap in ex.map(one, rows):
-            if cap:
-                r["market_cap_eok"] = round(cap)
+    if missing:
+        print(f"추세 지표를 받지 못한 종목 {len(missing)}개 → {', '.join(missing[:8])}",
+              file=sys.stderr)
 
 
 def collect_kr_market_data():
     now_kst = datetime.now(KST)
     start = (now_kst - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
 
-    # 1) 지수·환율 — 추세 지표가 필요하므로 여기만 yfinance 시계열을 쓴다.
-    idx = download_history(list(KR_INDICES.keys()), start=start)
-    if BENCHMARK_KR not in idx or len(idx[BENCHMARK_KR]["close"]) < 2:
-        raise RuntimeError("지수 데이터 수집 실패(^KS11)")
-    bench_close = idx[BENCHMARK_KR]["close"]
-    bench = trend_metrics(bench_close)
-    dates = list(bench_close.index)
-    t_date, t1_date = dates[-1].date(), (dates[-2].date() if len(dates) >= 2 else None)
+    # 1) 지수 — 종가·등락률·기준 세션은 네이버에서, 추세 지표만 yfinance 시계열에서.
+    #    세션 날짜를 지수 시계열이 아니라 거래소 상태(marketStatus/localTradedAt)에서
+    #    뽑는다. 라벨과 데이터가 다른 소스에서 나오면 어긋나도 오류가 안 난다.
+    kospi = naver_index("KOSPI")
+    if kospi.get("traded_at") is None:
+        raise RuntimeError("코스피 지수 상태를 받지 못했습니다")
+    t_date = datetime.fromisoformat(kospi["traded_at"]).date()
+    market_status = kospi.get("market_status")
 
+    hist_idx = download_history(list(KR_INDICES.keys()), start=start)
+    bench_close = hist_idx.get(BENCHMARK_KR, {}).get("close")
+    if bench_close is None or len(bench_close) < 2:
+        raise RuntimeError("코스피 시계열 수집 실패(^KS11)")
+    bench = trend_metrics(bench_close)
+    t1_date = bench_close.index[-2].date() if len(bench_close) >= 2 else None
+
+    live = {"^KS11": kospi, "^KQ11": naver_index("KOSDAQ")}
     indices = []
     for ticker, name in KR_INDICES.items():
-        h = idx.get(ticker)
-        if h is None or len(h["close"]) < 2:
-            indices.append({"ticker": ticker, "name": name, "error": "N/A"})
-            continue
-        s = h["close"]
-        m = trend_metrics(s)
-        row = {
-            "ticker": ticker, "name": name, "close": round(float(s.iloc[-1]), 2),
-            "chg_pct_d": m.get("chg_pct_d"), "ret_5d": m.get("ret_5d"),
-            "ret_20d": m.get("ret_20d"), "vs_ma200": m.get("vs_ma200"),
-            "pct_from_52w_high": m.get("pct_from_52w_high"),
-        }
-        if ticker == "KRW=X":      # 24시간 거래라 당일 봉 확정이 늦을 수 있다
-            row["as_of"] = str(s.index[-1].date())
+        h = hist_idx.get(ticker)
+        m = trend_metrics(h["close"]) if h is not None and len(h["close"]) >= 2 else {}
+        row = {"ticker": ticker, "name": name,
+               "ret_5d": m.get("ret_5d"), "ret_20d": m.get("ret_20d"),
+               "vs_ma200": m.get("vs_ma200"),
+               "pct_from_52w_high": m.get("pct_from_52w_high")}
+        if ticker in live:                      # 지수는 네이버 실측값을 쓴다
+            row["close"] = live[ticker]["close"]
+            row["chg_pct_d"] = live[ticker]["chg_pct_d"]
+        elif h is not None and len(h["close"]) >= 2:
+            row["close"] = round(float(h["close"].iloc[-1]), 2)
+            row["chg_pct_d"] = m.get("chg_pct_d")
+            row["as_of"] = str(h["close"].index[-1].date())   # 환율은 갱신 시점이 다르다
+        else:
+            row["error"] = "N/A"
         indices.append(strip_none(row))
 
-    # 2)(3) 시장별 당일 상승률 상위 — 시장 전체를 받아 상위 N개를 자른다.
+    # 2)(3) 시장별 당일 상승률 상위 — 시장 전체가 모집단이다.
     tops = {}
     for market, key in (("KOSPI", "kospi_top_gainers"), ("KOSDAQ", "kosdaq_top_gainers")):
-        allrows = naver_gainers(market)
-        picked = allrows
-        if MIN_CAP_EOK > 0:
-            head = allrows[:TOP_N * 6]      # 필터 통과분을 채우기 위한 여유분만 조회
-            fetch_caps_eok(head)
-            picked = [r for r in head if (r.get("market_cap_eok") or 0) >= MIN_CAP_EOK]
-        picked = picked[:TOP_N]
+        picked, universe = naver_gainers(market, TOP_N)
         attach_trend(picked, bench)
         tops[key] = picked
-        tops[key + "_universe"] = len(allrows)
+        tops[key + "_universe"] = universe
 
-    # 4)(5) 업종 — 강세 2개 / 약세 1개, 각 업종의 구성종목 전체에서 최강·최약 3개.
+    # 4)(5) 업종 — 강세 2개 / 약세 1개, 각 업종 구성종목 전체에서 최강·최약 3개.
     sectors = naver_sectors()
     strong, weak = [], None
-    for no, name, chg in sectors[:2]:
+    for no, name, chg, up, down, total in sectors[:2]:
         members = naver_sector_members(no)
         top3 = members[:3]
         attach_trend(top3, bench)
-        strong.append({"sector": name, "chg_pct_d": chg, "members": len(members),
-                       "up": sum(1 for m in members if m["chg_pct_d"] > 0),
-                       "down": sum(1 for m in members if m["chg_pct_d"] < 0),
-                       "top3_by_daily_change": top3})
+        strong.append({"sector": name, "chg_pct_d": chg, "members": total or len(members),
+                       "up": up, "down": down, "top3_by_daily_change": top3})
     if sectors:
-        no, name, chg = sectors[-1]
+        no, name, chg, up, down, total = sectors[-1]
         members = naver_sector_members(no)
         bottom3 = members[-3:][::-1]
         attach_trend(bottom3, bench)
-        weak = {"sector": name, "chg_pct_d": chg, "members": len(members),
-                "up": sum(1 for m in members if m["chg_pct_d"] > 0),
-                "down": sum(1 for m in members if m["chg_pct_d"] < 0),
-                "bottom3_by_daily_change": bottom3}
+        weak = {"sector": name, "chg_pct_d": chg, "members": total or len(members),
+                "up": up, "down": down, "bottom3_by_daily_change": bottom3}
 
     return {
         "market": "KR",
         "session_date": str(t_date),
         "prev_session_date": str(t1_date),
         "generated_at_kst": now_kst.strftime("%Y-%m-%d %H:%M"),
+        "market_status": market_status,
         "benchmark": strip_none({"ticker": BENCHMARK_KR, "name": "코스피(상대강도 기준)", **bench}),
         "indices": indices,
         **tops,
