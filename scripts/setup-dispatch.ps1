@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   최초 1회 설정 — GitHub 토큰을 암호화 저장하고, 작업 스케줄러에 등록한다.
 
@@ -58,10 +58,15 @@ $settings = New-ScheduledTaskSettingsSet `
     -WakeToRun `
     -StartWhenAvailable `
     -DontStopOnIdleEnd `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
     -MultipleInstances IgnoreNew
-# WakeToRun        : 절전 상태면 깨워서 실행 (완전히 꺼져 있으면 불가)
-# StartWhenAvailable: 그 시각에 PC가 꺼져 있었다면 켜진 직후 따라잡아 실행
+# WakeToRun                 : 절전 상태면 깨워서 실행 (완전히 꺼져 있으면 불가)
+# StartWhenAvailable        : 그 시각에 PC가 꺼져 있었다면 켜진 직후 따라잡아 실행
+# AllowStartIfOnBatteries   : 이 둘은 기본값이 '배터리면 실행 안 함'이다. UPS나 노트북에서
+# DontStopIfGoingOnBatteries: 전원이 배터리로 바뀌는 순간 작업이 조용히 건너뛰어진다 —
+#                             브리핑이 안 온 이유가 전원 상태라는 것은 아무 데도 안 남는다.
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -73,6 +78,12 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
 
 Write-Host ""
 Write-Host "등록 완료: '$TaskName'  화~토 $At" -ForegroundColor Green
+Write-Host ""
+Write-Host "※ 이 작업은 '로그온 상태'에서만 실행됩니다(토큰이 사용자 계정 키로" -ForegroundColor Yellow
+Write-Host "   암호화되어 있어 그렇습니다). 화면이 잠긴 것은 괜찮지만, 로그아웃하거나" -ForegroundColor Yellow
+Write-Host "   PC를 완전히 끄면 실행되지 않습니다. 로그오프 상태에서도 돌려야 한다면" -ForegroundColor Yellow
+Write-Host "   작업 스케줄러에서 이 작업을 열어 '사용자의 로그온 여부에 관계없이 실행'을" -ForegroundColor Yellow
+Write-Host "   선택하고 Windows 계정 암호를 저장하세요." -ForegroundColor Yellow
 Get-ScheduledTask -TaskName $TaskName |
     Get-ScheduledTaskInfo |
     Select-Object TaskName, NextRunTime, LastRunTime, LastTaskResult |
