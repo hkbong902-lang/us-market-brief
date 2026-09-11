@@ -170,17 +170,21 @@ function Register-BriefTask {
     # DontStopIfGoingOnBatteries: 전원이 배터리로 바뀌는 순간 작업이 조용히 건너뛰어진다 —
     #                             브리핑이 안 온 이유가 전원 상태라는 것은 아무 데도 안 남는다.
 
+    # ★ 먼저 제거하지 않는다 (2026-09-11). -Force 로 덮어쓴다.
+    #   Unregister 후 Register 하면, Windows 암호가 틀려 Register 가 throw 할 때
+    #   ($ErrorActionPreference='Stop' 이므로 즉시 중단) 이미 기존 작업이 사라진
+    #   상태가 된다 - 재등록을 시도했다가 작동하던 작업까지 잃는다. -Force 는
+    #   성공할 때만 교체하므로 실패 시 기존 등록이 그대로 남는다.
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-Host "  기존 '$TaskName' 제거 후 재등록합니다." -ForegroundColor Yellow
+        Write-Host "  기존 '$TaskName' 을 덮어씁니다(실패하면 기존 등록이 유지됩니다)." -ForegroundColor Yellow
     }
     if ($winPassword) {
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
             -Settings $settings -Description $Description `
-            -User $taskUser -Password $winPassword | Out-Null
+            -User $taskUser -Password $winPassword -Force | Out-Null
     } else {
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-            -Settings $settings -Description $Description | Out-Null
+            -Settings $settings -Description $Description -Force | Out-Null
     }
 
     # 등록 결과를 다시 읽어 확인한다. 인자를 넘겼다는 사실은 결과가 아니다.
