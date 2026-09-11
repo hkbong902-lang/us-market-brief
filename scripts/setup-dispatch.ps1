@@ -63,9 +63,15 @@ if (-not $SkipToken) {
     Write-Host "  대상 : $Repo"
     Write-Host "  권한 : Actions = Read and write"
     Write-Host ""
+    # ★ 붙여넣는 자리 근처에 '값처럼 생긴 문자열'을 두지 않는다 (2026-09-11 결정).
+    #   안내와 프롬프트를 분리하는 것만으로는 부족하다 — 형태를 알려주려고 적은 예시일수록
+    #   진짜 값과 닮아서, 그 예시 자체가 붙여넣기 후보가 된다. 프롬프트 라벨에 토큰
+    #   접두사를 쓰면 라벨이 곧 미끼다. 형태는 값이 아니라 서술로만 주고, 접두사 같은
+    #   구체적 형태 정보는 실패 메시지 쪽에 둔다(아래 검증 블록). 그러면 틀렸을 때만
+    #   보이고, 맞힐 때는 미끼가 되지 않는다.
     Write-Host "아래에는 토큰 값만 붙여넣으십시오 — 위 안내문이 아닙니다." -ForegroundColor Yellow
-    Write-Host "(github_pat_ 로 시작하는 한 줄. 화면에는 표시되지 않습니다.)" -ForegroundColor Yellow
-    $secure = Read-Host -AsSecureString "github_pat_..."
+    Write-Host "(공백 없는 한 줄. 화면에는 표시되지 않습니다.)" -ForegroundColor Yellow
+    $secure = Read-Host -AsSecureString "토큰"
     if ($secure.Length -eq 0) { throw "토큰이 비어 있습니다." }
 
     # ★ 저장 전에 검증한다 (2026-09-11 사고).
