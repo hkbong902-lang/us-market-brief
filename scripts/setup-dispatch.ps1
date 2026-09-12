@@ -5,8 +5,11 @@
 .DESCRIPTION
   실행 전에 GitHub에서 fine-grained personal access token을 만들어 두세요.
     https://github.com/settings/personal-access-tokens
-      Repository access : hkbong902-lang/us-market-brief 만 선택
-      Permissions       : Actions = Read and write  (이것만 있으면 됩니다)
+      Repository access : 'Only select repositories' → hkbong902-lang/us-market-brief
+                          ★ 이것을 먼저 해야 한다. 기본값 'Public Repositories (read-only)' 에서는
+                            Permissions 섹션이 비활성이라 아래를 설정할 수 없다. 그리고 이 저장소는
+                            공개라서 읽기는 통과하므로 토큰이 정상처럼 보인다(dispatch 만 403).
+      Permissions       : Actions = Read and write  (Metadata: Read-only 는 자동 부여)
       Expiration        : 만료일을 적어두세요. 만료되면 브리핑이 조용히 멈춥니다.
 
   실행 중 두 가지를 입력받습니다:
@@ -60,8 +63,14 @@ if (-not $SkipToken) {
     Write-Host ""
     Write-Host "GitHub fine-grained token 이 필요합니다." -ForegroundColor Cyan
     Write-Host "  발급 : https://github.com/settings/personal-access-tokens"
-    Write-Host "  대상 : $Repo"
-    Write-Host "  권한 : Actions = Read and write"
+    Write-Host ""
+    Write-Host "  ★ 순서가 중요합니다 (2026-09-12 사고). 1) 을 먼저 하지 않으면 2) 가 불가능합니다."
+    Write-Host "  1) Repository access : 'Only select repositories' 선택 후 $Repo 추가"
+    Write-Host "     기본값인 'Public Repositories (read-only)' 로 두면 Permissions 섹션이"
+    Write-Host "     비활성이라 Actions 권한을 줄 수 없습니다. 공개 저장소라 읽기는 통과하므로"
+    Write-Host "     토큰이 멀쩡해 보이지만 dispatch(POST)는 403 으로 죽습니다."
+    Write-Host "  2) Permissions > Repository permissions > Actions = Read and write"
+    Write-Host "     (Metadata: Read-only 가 자동으로 붙습니다 - 정상입니다)"
     Write-Host ""
     # ★ 붙여넣는 자리 근처에 '값처럼 생긴 문자열'을 두지 않는다 (2026-09-11 결정).
     #   안내와 프롬프트를 분리하는 것만으로는 부족하다 — 형태를 알려주려고 적은 예시일수록
@@ -139,11 +148,16 @@ if (-not $SkipToken) {
         } elseif ($code -eq 403) {
             $plainTok = $null
             throw ("토큰에 쓰기 권한이 없습니다(HTTP 403).`n" +
-                   "  읽기는 통과했지만 dispatch(POST)가 거부됐습니다 = Actions 가 Read-only 입니다.`n" +
-                   "  GitHub > Settings > Developer settings > Personal access tokens > Fine-grained tokens`n" +
-                   "  에서 해당 토큰을 열어 Permissions > Actions 를 'Read and write' 로 바꾸고 Update 하십시오.`n" +
+                   "  읽기는 통과했지만 dispatch(POST)가 거부됐습니다.`n" +
+                   "  해당 토큰을 https://github.com/settings/personal-access-tokens 에서 열어,`n" +
+                   "  아래를 이 순서로 확인하십시오:`n" +
+                   "   (1) Repository access 가 'Public Repositories (read-only)' 인지 -- 그러면 Permissions`n" +
+                   "       섹션이 비활성이라 Actions 항목 자체가 보이지 않습니다. 'Only select repositories'`n" +
+                   "       로 바꾸고 $Repo 를 선택하십시오. 공개 저장소는 읽기가 통과하므로 이 상태에서도`n" +
+                   "       토큰이 멀쩡해 보입니다 -- 403 의 가장 흔한 원인입니다.`n" +
+                   "   (2) 그다음 Permissions > Repository permissions > Actions 를 'Read and write' 로.`n" +
                    "  ★ 권한만 바꾸면 토큰 값은 그대로이므로 새로 발급할 필요가 없습니다.`n" +
-                   "  저장하지 않았습니다. 권한 변경 후 이 스크립트를 재실행하세요.")
+                   "  저장하지 않았습니다. 변경 후 이 스크립트를 재실행하세요.")
         } else {
             $plainTok = $null
             throw ("토큰 쓰기 권한을 확인할 수 없습니다(HTTP $code): $($_.Exception.Message)`n" +
