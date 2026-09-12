@@ -96,15 +96,62 @@ if (-not $SkipToken) {
         "User-Agent"           = "us-market-brief-dispatcher"
         "X-GitHub-Api-Version" = "2022-11-28"
     }
+    # ── (1) 읽기 확인 ──
+    $wfList = $null
     try {
-        $null = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/actions/workflows" `
+        $wfList = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/actions/workflows" `
             -Headers $hdrT -TimeoutSec 30
-        Write-Host "토큰 확인 완료: $Repo 의 Actions 에 접근됩니다." -ForegroundColor Green
     } catch {
         $plainTok = $null
-        throw ("토큰이 거부되었습니다: $($_.Exception.Message)`n" +
+        throw ("토큰이 거부되었습니다(읽기): $($_.Exception.Message)`n" +
                "  401 이면 토큰 값이 잘못되었거나 만료된 것이고, 404 면 Repository access 가 $Repo 를 포함하지 않은 것입니다.`n" +
                "  저장하지 않았습니다. 토큰을 다시 확인해 이 스크립트를 재실행하세요.")
+    }
+
+    # ── (2) ★ 쓰기 확인 — 읽기만 검증하면 안 된다 (2026-09-12 사고) ──
+    #   종전에는 (1) 만 하고 통과시켰다. 그런데 dispatch 는 POST .../dispatches 이고
+    #   이것은 Actions: Read and write 를 요구한다. Read 만 있는 토큰이 (1) 을 통과해
+    #   저장됐고, 다음 정시 실행에서 403 으로 죽었다 — 검증이 실제로 실패할 작업보다
+    #   약한 작업을 테스트한 탓이다.
+    #
+    #   ★ 일부러 존재하지 않는 ref 로 POST 한다. 권한 검사가 ref 해석보다 먼저이므로
+    #     권한이 있으면 422(ref 없음), 없으면 403 이 온다. 즉 워크플로를 실행시키지
+    #     않고 쓰기 권한만 판정할 수 있다. 되돌리지 말 것.
+    $probeWf = ($wfList.workflows | Select-Object -First 1)
+    if (-not $probeWf) {
+        $plainTok = $null
+        throw "저장소 $Repo 에 워크플로가 없습니다. 경로를 확인하세요. 저장하지 않았습니다."
+    }
+    $probeUri = "https://api.github.com/repos/$Repo/actions/workflows/$($probeWf.id)/dispatches"
+    $probeBody = '{"ref":"zz-permission-probe-nonexistent"}'
+    $writeOk = $false
+    try {
+        $null = Invoke-RestMethod -Uri $probeUri -Method Post -Headers $hdrT `
+            -Body $probeBody -ContentType 'application/json' -TimeoutSec 30
+        # 204 가 오면 존재하지 않는 ref 로 실행이 시작된 것이다(이례적). 권한은 확실하다.
+        $writeOk = $true
+        Write-Host "주의: 권한 탐침이 실행을 시작했을 수 있습니다. Actions 탭을 확인하세요." -ForegroundColor Yellow
+    } catch {
+        $code = $null
+        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+        if ($code -eq 422) {
+            $writeOk = $true          # 권한 OK, ref 만 없는 것 — 의도한 결과다
+        } elseif ($code -eq 403) {
+            $plainTok = $null
+            throw ("토큰에 쓰기 권한이 없습니다(HTTP 403).`n" +
+                   "  읽기는 통과했지만 dispatch(POST)가 거부됐습니다 = Actions 가 Read-only 입니다.`n" +
+                   "  GitHub > Settings > Developer settings > Personal access tokens > Fine-grained tokens`n" +
+                   "  에서 해당 토큰을 열어 Permissions > Actions 를 'Read and write' 로 바꾸고 Update 하십시오.`n" +
+                   "  ★ 권한만 바꾸면 토큰 값은 그대로이므로 새로 발급할 필요가 없습니다.`n" +
+                   "  저장하지 않았습니다. 권한 변경 후 이 스크립트를 재실행하세요.")
+        } else {
+            $plainTok = $null
+            throw ("토큰 쓰기 권한을 확인할 수 없습니다(HTTP $code): $($_.Exception.Message)`n" +
+                   "  저장하지 않았습니다.")
+        }
+    }
+    if ($writeOk) {
+        Write-Host "토큰 확인 완료: $Repo 의 Actions 에 읽기·쓰기 모두 가능합니다." -ForegroundColor Green
     }
     $plainTok = $null
 
