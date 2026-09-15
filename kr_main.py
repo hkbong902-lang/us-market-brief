@@ -32,6 +32,7 @@ from main import (
     strip_none,
     run_claude_brief,
     send_telegram,
+    session_is_current,
 )
 
 KR_INDICES = {
@@ -464,7 +465,9 @@ def main():
     session = datetime.strptime(data["session_date"], "%Y-%m-%d").date()
 
     # 17:30 KST 실행이므로 정상 거래일이면 최근 세션은 'KST 기준 오늘'이어야 한다.
-    if session != now_kst.date():
+    # 백업 크론(19:00 KST)이 늦어 KST 자정을 넘긴 실행은 '직전 영업일' 도 정상으로
+    # 받는다 - 판정 근거는 main.session_is_current 주석 참조.
+    if not session_is_current(session, now_kst):
         if os.environ.get("FORCE_SEND") == "1":
             print(f"FORCE_SEND=1 → 휴장 판정을 무시하고 직전 세션({session}) 기준으로 발송")
         elif os.environ.get("SKIP_ON_HOLIDAY", "1") == "1":

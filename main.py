@@ -337,6 +337,43 @@ def attach_rs_rank(rows, hist, bench_close, lookback=20, ago=5):
             r["rs_rank_change_5d"] = prev - cur      # 양수면 순위 상승
 
 
+def prev_business_day(d):
+    """d 의 직전 영업일(주말 제외). 공휴일은 모른다 - 알 필요도 없다."""
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+# 휴장 판정이 받아들이는 세션 날짜를 '그 시장의 오늘' 한 점에서 '오늘 또는 직전
+# 영업일' 로 넓힌다. 단, 직전 영업일은 ROLLOVER_HOUR 이전 실행에만 허용한다.
+#
+# 왜 (2026-09-15):
+#   휴장 판정은 "정시에 돌면 최근 세션 = 오늘" 이라는 전제 위에 서 있었다. 그런데
+#   이 파이프라인의 백업 크론은 실측으로 112/113/243/273 분씩 늦게 발화한다. 크론
+#   슬롯과 그 시장의 자정 사이 여유는 KR 300 분 / US 270 분뿐이라, 실측 최악값
+#   (KR 273분)이 이미 27 분 앞까지 와 있었다. 자정을 넘긴 실행은 now.date() 가
+#   하루 앞서므로 멀쩡한 거래일을 휴장으로 오판한다. KR 은 기본값이 '발송 생략'
+#   이어서 증상이 완전한 침묵이고, 성공한 실행으로 기록되므로 누락 감시에도 안
+#   걸린다. 가드의 UTC 자정 결함(2026-09-15 US 중복 발송)과 같은 부류다.
+#
+# 왜 ROLLOVER_HOUR 로 한 번 더 자르나:
+#   '오늘 또는 직전 영업일' 을 무조건 받으면 진짜 공휴일에도 통과해 직전 세션
+#   브리핑이 한 번 더 나간다 - 한국 공휴일만 연 15 회 안팎의 중복 발송이다.
+#   자정을 넘겨 온 실행은 그 시장 시각으로 새벽(0~5 시)에만 도착하고, 정상 발송과
+#   휴장 판정은 모두 오후~밤에 일어난다. 정오는 그 둘 사이에서 양쪽으로 다섯
+#   시간 이상 떨어진 지점이다. session == 오늘 은 시각과 무관하게 항상 받으므로,
+#   장중 수동 실행 같은 기존 용법은 그대로 살아 있다.
+ROLLOVER_HOUR = 12
+
+
+def session_is_current(session, now):
+    """session 이 이 실행이 다루기로 된 영업일인가."""
+    if session == now.date():
+        return True
+    return session == prev_business_day(now.date()) and now.hour < ROLLOVER_HOUR
+
+
 def latest_session_info(closes_gspc):
     """S&P500 시계열로 최근 마감 세션(T)과 T-1 날짜를 확정."""
     dates = list(closes_gspc.index)
@@ -1155,9 +1192,11 @@ def main():
 
     # 아침 7시(KST) 실행 시, 마감된 세션은 'ET 기준 오늘' 날짜여야 함.
     # 아니라면 그날 미국장은 휴장(공휴일)이었던 것.
+    # 크론이 늦어 ET 자정을 넘긴 실행은 '직전 영업일' 도 정상으로 받는다 -
+    # 판정 근거는 session_is_current 주석 참조.
     # FORCE_SEND=1이면 휴장 판정을 건너뛰고 직전 마감 세션으로 정상 브리핑을 만든다.
     # 주말·공휴일에도 전체 경로(Claude API·웹검색·발송)를 검증할 수 있게 하는 스위치.
-    if session != now_et.date():
+    if not session_is_current(session, now_et):
         if os.environ.get("FORCE_SEND") == "1":
             print(f"FORCE_SEND=1 → 휴장 판정을 무시하고 직전 마감 세션({session}) 기준으로 발송")
         elif os.environ.get("SKIP_ON_HOLIDAY") == "1":
