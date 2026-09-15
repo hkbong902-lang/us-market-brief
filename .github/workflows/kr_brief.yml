@@ -51,13 +51,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          since=$(date -u +%Y-%m-%dT00:00:00Z)
+          # ★ 창을 'UTC 자정 이후' 가 아니라 '최근 12시간' 으로 잡는다 (2026-09-15).
+          #   자정 기준은 US 브리핑에서 틀린다. 정시 dispatch 는 07:20 KST = 22:20Z 로
+          #   UTC 로는 '전날' 이고, 크론이 조금만 늦어 00:00Z 를 넘겨 발화하면 since 가
+          #   새 UTC 날짜로 점프하면서 그 dispatch 성공을 못 본다. 실제로 2026-09-15 에
+          #   dispatch(22:20Z)가 성공했는데 크론이 01:45Z 에 발화해 중복 발송됐다.
+          #   상대 창은 날짜 경계가 없어 이 실패 모드가 원천적으로 사라진다.
+          #   12시간: 정시(-3h20m)와 크론 실측 지연(최대 ~4h30m)을 모두 덮고,
+          #   전날 같은 시각(-24h)은 덮지 않는 폭이다.
+          #   ★ 상한도 닫는다. 실시간에는 차이가 없지만, 과거 시점을 재현해 점검할 때
+          #     열린 상한은 그 이후의 실행까지 세어 재현을 무의미하게 만든다.
+          since=$(date -u -d '12 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          until=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           runs=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/kr_brief.yml/runs?per_page=20&status=success&created=>=${since}")
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/kr_brief.yml/runs?per_page=20&status=success&created=${since}..${until}")
           # 자기 자신은 아직 success 가 아니므로 집계에 잡히지 않는다.
           count=$(printf '%s' "$runs" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workflow_runs",[])))')
-          echo "오늘(UTC $since 이후) 성공한 실행: ${count}건"
+          echo "최근 12시간(UTC $since ~ $until) 성공한 실행: ${count}건"
           if [ "$count" -gt 0 ]; then
             echo "정시 경로가 이미 브리핑을 보냈습니다 → 백업 크론 실행을 건너뜁니다."
             echo "skip=true" >> "$GITHUB_OUTPUT"
