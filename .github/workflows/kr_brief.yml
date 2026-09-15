@@ -28,6 +28,10 @@ on:
         description: "휴장(주말·공휴일)이어도 직전 마감 세션 브리핑을 강제 발송"
         type: boolean
         default: false
+      no_ai:
+        description: "해설 생성 없이 수치 요약본만 발송 (Claude API 미사용 = 비용 0)"
+        type: boolean
+        default: false
 
 jobs:
   send-kr-brief:
@@ -82,6 +86,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # 수동 실행에서 체크했을 때만 "1". 스케줄 실행에서는 inputs가 없어 항상 "0".
           FORCE_SEND: ${{ inputs.force_send && '1' || '0' }}
+          # USE_CLAUDE=0 이면 Claude 를 호출하지 않고 결정론적 수치 브리핑만 보낸다.
+          # 비용이 0 이 되고, 머리말에 '수치 요약본' 표시가 붙어 장애와 구별된다.
+          # schedule 실행에는 inputs 가 없으므로 항상 '1' 이다(평소 동작).
+          USE_CLAUDE: ${{ inputs.no_ai && '0' || '1' }}
           # 종목마다 '왜 움직였는가' 1줄을 붙이는 구성이라 미국편(5회)보다 검색을 더 쓴다.
           KR_WEB_SEARCH_MAX_USES: "10"
           # CLAUDE_MODEL: claude-sonnet-5

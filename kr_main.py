@@ -389,16 +389,20 @@ def _line(r):
     return f"<b>{r['name']}</b> {r['chg_pct_d']:+.2f}%{d20}"
 
 
-def build_kr_fallback_brief(data, reason=None):
+def build_kr_fallback_brief(data, reason=None, failed=True):
     """Claude 호출이 실패했을 때의 수치 위주 브리핑.
 
     머리에 반드시 경고를 붙인다. 축약본이 정상 브리핑과 같은 모습으로 도착하면
     장애가 '해설이 좀 빠진 것'으로 읽히고, 원인(예: API 크레딧 소진)을 찾기까지
     시간이 걸린다. 겉모습으로 구분되게 하는 것이 이 한 줄의 목적이다.
     """
-    L = [f"⚠️ <b>AI 해설 생성에 실패해 수치 요약만 발송합니다.</b>"]
-    if reason:
-        L.append(f"<i>사유: {reason}</i>")
+    # failed=False 는 USE_CLAUDE=0 으로 의도해서 끈 경우다 - 장애가 아니므로 문구가 다르다.
+    if failed:
+        L = ["⚠️ <b>AI 해설 생성에 실패해 수치 요약만 발송합니다.</b>"]
+        if reason:
+            L.append(f"<i>사유: {reason}</i>")
+    else:
+        L = ["📊 <b>수치 요약본</b> <i>(해설 생성을 끄도록 설정되어 있습니다)</i>"]
     L += ["", f"🇰🇷 <b>한국 증시 마감 브리핑 — {data['session_date']}</b>", ""]
 
     L.append("<b>① 지수·환율</b>")
@@ -476,9 +480,10 @@ def main():
         return
 
     brief, reason = None, None
+    skipped = os.environ.get("USE_CLAUDE", "1") == "0"
     try:
         brief = build_kr_brief_with_claude(data)
-        if not brief:
+        if not brief and not skipped:
             reason = "ANTHROPIC_API_KEY 미설정 또는 빈 응답"
     except Exception as e:
         # requests가 raise_for_status로 올린 예외에는 응답 객체가 붙어 있고, 사유는
@@ -492,7 +497,7 @@ def main():
         reason = (f"{e} — {body}" if body else str(e))[:400]
         print(f"Claude API 실패 → 기본 브리핑으로 대체: {reason}", file=sys.stderr)
     if not brief:
-        brief = build_kr_fallback_brief(data, reason)
+        brief = build_kr_fallback_brief(data, reason, failed=not skipped)
 
     send_telegram(brief)
     print("텔레그램 발송 완료")

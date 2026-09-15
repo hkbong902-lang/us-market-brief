@@ -15,6 +15,8 @@ US Market Daily Brief -> Telegram
                                     구형 모델을 쓰면 web_search_20250305)
               SKIP_ON_HOLIDAY ("1"이면 휴장일에 아무것도 안 보냄, 기본은 휴장 안내 발송)
               FORCE_SEND ("1"이면 휴장 판정을 무시하고 직전 마감 세션 브리핑을 발송. 테스트용)
+              USE_CLAUDE ("0"이면 Claude 를 호출하지 않고 수치 요약본만 발송 - API 비용 0)
+              CLAUDE_RATE_IN / CLAUDE_RATE_OUT (USAGE 로그의 est_usd 계산 단가 override)
 """
 
 import json
@@ -744,6 +746,63 @@ def _extract_brief_text(content):
     return "\n".join(parts).strip()
 
 
+# 단가(USD / 1M 토큰). 2026-09-15 확인치이며 모델·시점에 따라 바뀐다.
+# ★ 로그의 est_usd 는 추정이다 - 청구서가 진실이다. 단가가 바뀌면 여기를 고치거나
+#   CLAUDE_RATE_IN / CLAUDE_RATE_OUT 로 덮어쓴다.
+_RATES = {
+    "claude-sonnet-5":  (2.0, 10.0),
+    "claude-opus-5":    (5.0, 25.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-fable-5-1": (10.0, 50.0),
+}
+
+
+def _accumulate_usage(total, u):
+    """이어쓰기로 여러 번 호출될 수 있으므로 호출별 usage 를 합산한다."""
+    for k, v in (u or {}).items():
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            total[k] = total.get(k, 0) + v
+        elif isinstance(v, dict):                 # server_tool_use 등 중첩 카운터
+            bucket = total.setdefault(k, {})
+            for kk, vv in v.items():
+                if isinstance(vv, (int, float)) and not isinstance(vv, bool):
+                    bucket[kk] = bucket.get(kk, 0) + vv
+
+
+def _log_usage(model, calls, total):
+    """한 줄짜리 구조화 로그. 실행 로그에 남아 사후 집계가 가능해진다.
+
+    별도 측정 인프라를 만들지 않는 이유: 이 파이프라인은 무인 단발 실행이라 붙일 곳이
+    없고, Actions 실행 로그는 이미 보관된다. 사후 집계는
+        gh run view <id> --log | grep USAGE
+    로 끝난다. 인프라 0 이고, 없는 것보다 비교할 수 없이 낫다.
+    """
+    rate_in, rate_out = _RATES.get(model, (None, None))
+    try:
+        rate_in = float(os.environ.get("CLAUDE_RATE_IN") or rate_in or 0) or None
+        rate_out = float(os.environ.get("CLAUDE_RATE_OUT") or rate_out or 0) or None
+    except ValueError:
+        rate_in = rate_out = None
+
+    inp = total.get("input_tokens", 0)
+    out = total.get("output_tokens", 0)
+    cr = total.get("cache_read_input_tokens", 0)
+    cw = total.get("cache_creation_input_tokens", 0)
+    ws = (total.get("server_tool_use") or {}).get("web_search_requests", 0)
+
+    est = ""
+    if rate_in and rate_out:
+        # 캐시 읽기는 입력가의 10%, 5분 캐시 쓰기는 1.25배로 계산한다.
+        usd = (inp * rate_in + cr * rate_in * 0.10 + cw * rate_in * 1.25
+               + out * rate_out) / 1_000_000
+        est = " est_usd=%.4f" % usd
+    print("USAGE model=%s calls=%d input=%d cache_read=%d cache_write=%d "
+          "output=%d web_search=%d%s"
+          % (model, calls, inp, cr, cw, out, ws, est), file=sys.stderr)
+
+
 def _call_claude(api_key, body):
     """SSE 스트리밍으로 호출하고 {"content": [...], "stop_reason": ...} 로 되돌린다.
 
@@ -764,7 +823,10 @@ def _call_claude(api_key, body):
     )
     resp.raise_for_status()
 
-    content, stop_reason = [], None
+    # usage 는 두 이벤트에 나눠 온다. message_start 가 입력·캐시 계열을,
+    # message_delta 가 최종 출력 토큰을 준다. 종전에는 둘 다 버려서 이 파이프라인의
+    # 토큰 소비를 사후에 알 방법이 전혀 없었고, 비용 논의가 전부 추정이 됐다.
+    content, stop_reason, usage = [], None, {}
     for line in resp.iter_lines(decode_unicode=True):
         if not line or not line.startswith("data:"):
             continue
@@ -782,11 +844,15 @@ def _call_claude(api_key, body):
             delta = ev.get("delta", {})
             if delta.get("type") == "text_delta":
                 content[idx]["text"] = content[idx].get("text", "") + delta.get("text", "")
+        elif etype == "message_start":
+            usage.update(ev.get("message", {}).get("usage") or {})
         elif etype == "message_delta":
             stop_reason = ev.get("delta", {}).get("stop_reason", stop_reason)
+            # 스트림 순서상 나중에 오므로 output_tokens 는 여기 값이 최종값이다.
+            usage.update(ev.get("usage") or {})
         elif etype == "error":
             raise RuntimeError(f"Claude 스트림 오류: {ev.get('error')}")
-    return {"content": content, "stop_reason": stop_reason}
+    return {"content": content, "stop_reason": stop_reason, "usage": usage}
 
 
 def run_claude_brief(system_prompt, user_text, max_uses=5, default_max_tokens="32000"):
@@ -796,6 +862,16 @@ def run_claude_brief(system_prompt, user_text, max_uses=5, default_max_tokens="3
     스트리밍·이어쓰기·검색 안내멘트 제거는 실패를 겪으며 다듬어진 로직이라 브리핑마다
     복제하면 이후 수정이 한쪽에만 반영된다. 프롬프트만 갈아끼우고 경로는 하나로 둔다.
     """
+    # ★ USE_CLAUDE=0 이면 API 를 호출하지 않는다 (2026-09-15).
+    #   호출자는 None 을 '해설 없음' 으로 받아 결정론적 수치 브리핑으로 넘어간다.
+    #   키를 지우는 방식과 달리, 의도적 선택임이 로그와 머리말에 드러난다.
+    if os.environ.get("USE_CLAUDE", "1") == "0":
+        print("USE_CLAUDE=0 → Claude 호출을 건너뛰고 수치 요약본으로 발송합니다.",
+              file=sys.stderr)
+        print("USAGE model=none calls=0 input=0 cache_read=0 cache_write=0 "
+              "output=0 web_search=0 est_usd=0.0000", file=sys.stderr)
+        return None
+
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
@@ -829,9 +905,11 @@ def run_claude_brief(system_prompt, user_text, max_uses=5, default_max_tokens="3
     # 예산을 늘려도 절단 가능성은 남는다(검색 결과 분량은 실행마다 다르다). 잘렸으면
     # 지금까지 쓴 본문을 assistant 턴으로 되돌려주고 끊긴 지점부터 이어 쓰게 한다.
     # 무인 실행이라 잘린 브리핑이 그대로 발송되는 것이 가장 나쁜 결과다.
-    parts = []
+    parts, usage_total, calls = [], {}, 0
     for attempt in range(MAX_CONTINUATIONS + 1):
         payload = _call_claude(api_key, body)
+        calls += 1
+        _accumulate_usage(usage_total, payload.get("usage"))
         chunk = _extract_brief_text(payload["content"])
         if chunk:
             parts.append(chunk)
@@ -855,6 +933,8 @@ def run_claude_brief(system_prompt, user_text, max_uses=5, default_max_tokens="3
                 "마지막 면책 문구까지 반드시 완결할 것."
             )},
         ]
+
+    _log_usage(model, calls, usage_total)
 
     # 이어쓰기 조각은 문장 중간에서 갈라진 것이므로 구분자 없이 그대로 붙인다.
     return "".join(parts).strip() or None
@@ -891,9 +971,22 @@ def _rank_arrow(s):
     return f" {'↑' if d > 0 else '↓'}{abs(d)}"
 
 
-def build_fallback_brief(data):
-    """API 키가 없거나 실패했을 때의 수치 위주 브리핑."""
-    L = [f"📊 <b>미국 시장 브리핑 — {data['session_date']} (현지 마감)</b>", ""]
+def build_fallback_brief(data, reason=None, failed=True):
+    """해설 없이 수치만 담은 브리핑.
+
+    ★ 머리에 반드시 구분 표시를 붙인다 (2026-09-15). 종전에는 표시가 없어서, 축약본이
+      정상 브리핑과 똑같은 모습으로 도착했다 - 장애가 '해설이 좀 빠진 것' 으로 읽히고
+      원인(예: 크레딧 소진)을 찾기까지 시간이 걸린다. kr_main 쪽에는 이 한 줄이 처음부터
+      있었는데 이쪽에만 없었다. 같은 구조의 두 브리핑은 같은 신호를 내야 한다.
+      failed=False 는 USE_CLAUDE=0 으로 의도해서 끈 경우다 - 장애가 아니므로 문구가 다르다.
+    """
+    if failed:
+        L = ["⚠️ <b>AI 해설 생성에 실패해 수치 요약만 발송합니다.</b>"]
+        if reason:
+            L.append(f"<i>사유: {reason}</i>")
+    else:
+        L = ["📊 <b>수치 요약본</b> <i>(해설 생성을 끄도록 설정되어 있습니다)</i>"]
+    L += ["", f"📊 <b>미국 시장 브리핑 — {data['session_date']} (현지 마감)</b>", ""]
     L.append("<b>② 핵심 지표</b> <i>(전일 / 20일 / 연초)</i>")
     for r in data["indicators"]:
         if "error" in r:
@@ -1077,13 +1170,15 @@ def main():
             )
             return
 
-    brief = None
+    brief, reason = None, None
+    skipped = os.environ.get("USE_CLAUDE", "1") == "0"
     try:
         brief = build_brief_with_claude(data)
     except Exception as e:
+        reason = str(e)[:400]
         print(f"Claude API 실패 → 기본 브리핑으로 대체: {e}", file=sys.stderr)
     if not brief:
-        brief = build_fallback_brief(data)
+        brief = build_fallback_brief(data, reason, failed=not skipped)
 
     send_telegram(brief)
     print("텔레그램 발송 완료")
