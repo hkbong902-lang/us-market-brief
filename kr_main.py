@@ -246,12 +246,27 @@ def naver_foreign_rank(market):
     def rows(key):
         out = []
         for x in sec.get(key) or []:
+            if not x.get("itemname"):
+                continue
+            # ★ 장 마감 직후의 가집계 응답은 accTradeAmount 가 통째로 0 이다 (2026-09-28).
+            #   수량(accTradeVolume)과 현재가(nowPrice)는 정상으로 오므로 금액을 되살린다.
+            #   종전에는 0 을 그대로 실어 "순매수 상위 5" 가 전부 +0억으로 나갔다 -
+            #   순위는 맞고 금액만 0 이라, 값이 없다는 것도 드러나지 않았다.
+            #   수량 부호는 매도에서 음수로 유지되므로 곱해도 부호가 보존된다.
             amt = _num(x.get("accTradeAmount"))
-            if amt is None or not x.get("itemname"):
+            approx = False
+            if not amt:
+                qty = _num(x.get("accTradeVolume"))
+                px = _num(x.get("nowPrice"))
+                if qty and px:
+                    amt = qty * px
+                    approx = True
+            if not amt:
                 continue
             out.append({"name": x["itemname"].strip(), "code": x.get("itemcode"),
                         "market": market, "bizdate": x.get("bizdateTo"),
                         "estimated": bool(x.get("estimated")),
+                        "amount_derived": approx,
                         "net_eok": round(amt / 1e8)})
         return out
 
@@ -335,21 +350,42 @@ def collect_kr_flows(session_date):
             pool += naver_cap_pool(market, FLOW_POOL_N)
         except Exception as e:
             warn.append(f"{market} 시총 상위 모집단 수집 실패: {e}")
-    rows, skipped = [], 0
+    # ★ 종목별 확정 수급(stock/{code}/trend)은 당일치가 없다 (2026-09-28 확인).
+    #   17:35 은 물론 19:00 에도 최신 bizdate 가 '직전 세션'이다. 종전 코드는 당일
+    #   세션과 일치하는 행만 받아서, 모집단 200종목이 200종목 모두 탈락했고 기관·개인
+    #   순위가 통째로 사라졌다. 사용자에게는 "제공되지 않았다"로 나갔다.
+    #   당일치가 원래 없는 것이므로 '가장 최근 가용 세션'으로 물러나되, 그 기준일을
+    #   외국인(당일 가집계)과 별도로 표기해 두 블록의 날짜가 다르다는 것을 드러낸다.
+    #   ★ 같은-날 기관·개인 종목 순위는 네이버에 존재하지 않는다. 가집계는 외국인
+    #     전용이고(trendForeignOrg), 기관용 형제 엔드포인트도 전환 파라미터도 없다.
+    #     한투 KIS 의 '국내기관_외국인 매매종목가집계'가 이 구멍을 메운다.
+    rows, skipped, seen_dates = [], 0, {}
     for code, name, market in pool:
         try:
             f = naver_stock_flow(code)
         except Exception:
             skipped += 1
             continue
-        if not f or (f.get("bizdate") and f["bizdate"] != want):
+        if not f or not f.get("bizdate"):
             skipped += 1
             continue
+        seen_dates[f["bizdate"]] = seen_dates.get(f["bizdate"], 0) + 1
         rows.append({"name": name, "code": code, "market": market,
+                     "bizdate": f["bizdate"],
                      "institution_eok": round((f["institution_q"] or 0) * f["close"] / 1e8),
                      "individual_eok": round((f["individual_q"] or 0) * f["close"] / 1e8)})
+    stock_basis = None
+    if seen_dates:
+        # 가장 늦은 기준일로 통일한다. 종목마다 갱신 시점이 달라 섞이면 안 된다.
+        stock_basis = max(seen_dates)
+        dropped = [r for r in rows if r["bizdate"] != stock_basis]
+        rows = [r for r in rows if r["bizdate"] == stock_basis]
+        if dropped:
+            warn.append(f"기관·개인 모집단 중 {len(dropped)}종목은 기준일이 달라 제외")
     if skipped:
-        warn.append(f"모집단 {len(pool)}종목 중 {skipped}종목은 해당 세션 수급이 없어 제외")
+        warn.append(f"기관·개인 모집단 {len(pool)}종목 중 {skipped}종목은 수급 데이터가 없어 제외")
+    if stock_basis and stock_basis != want:
+        warn.append(f"기관·개인 종목 순위는 당일치가 공시되지 않아 직전 세션({stock_basis}) 기준이다")
 
     def top(key, sign):
         ranked = sorted(rows, key=lambda r: -sign * r[key])[:FLOW_RANK_N]
@@ -369,10 +405,20 @@ def collect_kr_flows(session_date):
         "individual_top_buy": top("individual_eok", 1) or None,
         "individual_top_sell": top("individual_eok", -1) or None,
         "foreign_universe": "코스피·코스닥 전 종목",
+        "foreign_basis_date": (f"{biz[:4]}-{biz[4:6]}-{biz[6:]}"
+                               if biz and len(biz) == 8 else biz),
+        "institution_individual_basis_date":
+            (f"{stock_basis[:4]}-{stock_basis[4:6]}-{stock_basis[6:]}"
+             if stock_basis and len(stock_basis) == 8 else stock_basis),
         "institution_individual_universe":
             f"코스피·코스닥 시총 상위 각 {FLOW_POOL_N}종목 중에서만 순위를 매겼다",
         "institution_individual_estimated":
-            "기관·개인 금액은 순매수 수량 × 종가로 환산한 추정치다(외국인은 거래소 집계 금액)",
+            ("기관·개인 금액은 순매수 수량 × 종가로 환산한 추정치다. 또한 종목별 확정 수급은 "
+             "당일치가 공시되지 않으므로 institution_individual_basis_date 가 외국인 기준일과 "
+             "다를 수 있다 - 다르면 반드시 그 날짜를 밝힐 것."),
+        "foreign_amount_note":
+            ("외국인 금액은 장 마감 직후 가집계라 거래소 집계 금액이 비어 있는 경우가 있다. "
+             "그때는 순매수 수량 × 현재가로 환산한 값이다(amount_derived=true)."),
         "pension_unavailable":
             "연기금은 제공 소스가 없어 이 브리핑에 없다. 연기금을 언급하지 말 것.",
         "warnings": warn or None,
@@ -482,6 +528,14 @@ def collect_kr_market_data():
     except Exception as e:
         flows = {"error": f"수급 수집 실패: {e}",
                  "pension_unavailable": "연기금은 제공 소스가 없다."}
+    # ★ 수집 경고를 실행 로그에도 내보낸다 (2026-09-28).
+    #   종전에는 warnings 를 데이터에만 담아 모델에게 넘겼다. 그래서 2026-09-28 에
+    #   기관·개인이 통째로 빠졌을 때 Actions 로그에는 아무 흔적이 없었고, 원인을
+    #   찾으려면 로컬에서 수집을 재현해야 했다. 사람이 읽는 곳에도 남겨야 한다.
+    for _w in (flows.get("warnings") or []):
+        print(f"FLOW-WARN {_w}", file=sys.stderr)
+    if flows.get("error"):
+        print(f"FLOW-ERROR {flows['error']}", file=sys.stderr)
 
     return {
         "market": "KR",
@@ -583,9 +637,13 @@ KR_SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데�
      (b) 투자자별 종목 순위를 외국인 → 기관 → 개인 순서로. 각 투자자마다
          순매수 상위 5와 순매도 상위 5를 한 줄씩. 형식:
            순매수 <b>SK하이닉스</b> +13,309억 · <b>가온전선</b> +1,094억 · …
-     (c) ★한계를 반드시 한 줄로 밝힐 것: 기관·개인 순위는 시총 상위 종목만을
-         모집단으로 하고 금액도 추정치라는 것. 이 한 줄이 빠지면 독자는 저 순위를
-         '전 종목 1위'로 읽는다 — 외국인만 전 종목 기준이다.
+     (c) ★한계를 반드시 밝힐 것. 두 가지다.
+         - 기관·개인 순위는 시총 상위 종목만 모집단이고 금액도 추정치다. 이 말이
+           빠지면 독자는 '전 종목 1위'로 읽는다 — 외국인만 전 종목 기준이다.
+         - ★institution_individual_basis_date 가 foreign_basis_date 와 다르면,
+           기관·개인 순위가 '직전 세션(그 날짜) 기준'임을 반드시 명시할 것. 종목별
+           확정 수급은 당일치가 공시되지 않아 하루 늦는 것이 정상이다. 두 날짜를
+           섞어 읽으면 '오늘 기관이 이걸 샀다'는 틀린 문장이 만들어진다.
      (d) 마지막 2~3문장으로 해석한다. 세 주체의 방향이 엇갈렸는지, 지수를 끌어올린
          주체가 누구인지, 그리고 ②~⑤에서 본 업종·종목과 수급이 같은 이야기를 하는지.
      ★연기금 데이터는 제공되지 않는다. 연기금을 언급하지 말 것.
@@ -689,8 +747,11 @@ def build_kr_fallback_brief(data, reason=None, failed=True):
                 if rows:
                     L.append(f"· {who} {tag}: " + " · ".join(
                         f"{r['name']} {r['net_eok']:+,.0f}" for r in rows))
-        L.append("<i>기관·개인 순위는 시총 상위 종목 모집단의 추정치입니다"
-                 " (외국인만 전 종목 기준).</i>")
+        iib = f.get("institution_individual_basis_date")
+        note = "기관·개인 순위는 시총 상위 종목 모집단의 추정치입니다 (외국인만 전 종목 기준)."
+        if iib and iib != f.get("foreign_basis_date"):
+            note += f" 기관·개인은 {iib} 세션 기준입니다(종목별 확정 수급은 당일치가 없습니다)."
+        L.append(f"<i>{note}</i>")
         for w in (f.get("warnings") or [])[:3]:
             L.append(f"<i>· {w}</i>")
         L.append("")
