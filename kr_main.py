@@ -634,10 +634,20 @@ KR_SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데�
 
   ⑦ 수급 — 오늘 누가 사고 누가 팔았나 (브리핑의 마지막 블록)
      investor_flows 로 쓴다. 단위는 억원이고 순매수 기준이므로 음수는 순매도다.
-     (a) 시장 전체: 코스피·코스닥 각각 외국인·기관·개인 순매수를 한 줄씩.
-     (b) 투자자별 종목 순위를 외국인 → 기관 → 개인 순서로. 각 투자자마다
-         순매수 상위 5와 순매도 상위 5를 한 줄씩. 형식:
-           순매수 <b>SK하이닉스</b> +13,309억 · <b>가온전선</b> +1,094억 · …
+     ★★기준일이 다른 숫자를 한 묶음에 섞지 말 것. foreign_basis_date 와
+       institution_individual_basis_date 가 다르면 반드시 두 묶음으로 나누고,
+       각 묶음 머리에 [YYYY-MM-DD 기준] 을 붙인다. 섞어 놓으면 독자가 두 묶음을
+       더해 산술이 깨진 것으로 읽는다 - 2026-09-29 발송분에서 '개인 순매수 상위
+       합'이 '시장 전체 개인'보다 커져 데이터 오류로 오인됐다(실제로는 날짜가
+       달랐을 뿐이다).
+     (a) [foreign_basis_date 기준] 묶음
+         - 시장 전체: 코스피·코스닥 각각 외국인·기관·개인 순매수를 한 줄씩.
+         - 외국인 순매수 상위 5 / 순매도 상위 5. 형식:
+             순매수 <b>SK하이닉스</b> +13,309억 · <b>가온전선</b> +1,094억 · …
+     (b) [institution_individual_basis_date 기준] 묶음
+         - 기관 순매수·순매도 상위 5, 개인 순매수·순매도 상위 5를 같은 형식으로.
+         - 두 기준일이 다르면 이 묶음 머리에 '날짜가 달라 위 숫자와 더할 수 없다'는
+           취지를 한 줄로 밝힌다.
      (c) ★한계를 반드시 밝힐 것. 두 가지다.
          - 기관·개인 순위는 시총 상위 종목만 모집단이고 금액도 추정치다. 이 말이
            빠지면 독자는 '전 종목 1위'로 읽는다 — 외국인만 전 종목 기준이다.
@@ -675,6 +685,76 @@ def _line(r):
     return f"<b>{r['name']}</b> {r['chg_pct_d']:+.2f}%{d20}"
 
 
+def _pct(v):
+    return f"{v:+.2f}%" if isinstance(v, (int, float)) else None
+
+
+def build_kr_narrative(data):
+    """해설 없이도 읽히는 서사를 규칙으로 만든다.
+
+    ★ 왜 (2026-09-30): Claude 크레딧이 없으면 폴백은 숫자만 남는다. 그런데 이
+      브리핑의 가치는 "몇 % 올랐나"가 아니라 "오늘 무슨 일이 있었나"다. 숫자만
+      나가면 독자가 매번 직접 조립해야 한다. AM-Brief 는 LLM 없이도 핵심요약을
+      만들어 내는데, 같은 재료(지수 방향·추세 위치·수급 방향·업종)가 여기에도 있다.
+      이것은 AI 해설의 대체물이 아니라 '해설이 없을 때의 바닥'이다 - 그래서 문구에
+      단정적 해석을 넣지 않고 관측된 사실의 연결까지만 쓴다.
+    """
+    out = []
+    idx = {r.get("name"): r for r in (data.get("indices") or [])}
+    ks, kq = idx.get("코스피"), idx.get("코스닥")
+
+    # 1) 두 지수의 방향과 추세 위치
+    if ks and ks.get("chg_pct_d") is not None and kq and kq.get("chg_pct_d") is not None:
+        a, b = ks["chg_pct_d"], kq["chg_pct_d"]
+        same = "나란히" if (a >= 0) == (b >= 0) else "엇갈려"
+        line = f"코스피 {_pct(a)} · 코스닥 {_pct(b)}로 두 시장이 {same} 움직였습니다."
+        ma = ks.get("vs_ma200")
+        if ma is not None:
+            where = "200일선 위" if ma > 0 else "200일선 아래"
+            line += f" 코스피는 {where}({ma:+.1f}%)에 있습니다."
+        out.append(line)
+
+    # 2) 지수와 개별 종목의 온도차 - 지수는 밀렸는데 상한가가 즐비한 날을 잡는다
+    tops = (data.get("kospi_top_gainers") or []) + (data.get("kosdaq_top_gainers") or [])
+    hot = [r for r in tops if (r.get("chg_pct_d") or 0) >= 20]
+    if ks and ks.get("chg_pct_d") is not None and hot:
+        if ks["chg_pct_d"] < 0:
+            out.append(f"지수는 내렸지만 상승률 상위에는 20% 이상 급등 종목이 {len(hot)}개"
+                       f" 있었습니다 - 지수와 개별 종목의 온도가 달랐습니다.")
+        elif len(hot) >= 5:
+            out.append(f"상승률 상위에 20% 이상 급등이 {len(hot)}개로, 중소형 테마가"
+                       f" 활발했습니다.")
+
+    # 3) 수급 세 주체의 방향
+    f = data.get("investor_flows") or {}
+    tot = (f.get("market_totals") or {}).get("코스피")
+    if tot:
+        fo, io_, pe = tot.get("foreign"), tot.get("institution"), tot.get("individual")
+        if None not in (fo, io_, pe):
+            def side(v):
+                return "순매수" if v > 0 else ("순매도" if v < 0 else "보합")
+            sellers = [n for n, v in (("외국인", fo), ("기관", io_), ("개인", pe)) if v < 0]
+            buyers = [n for n, v in (("외국인", fo), ("기관", io_), ("개인", pe)) if v > 0]
+            line = (f"코스피 수급은 외국인 {fo:+,.0f}억({side(fo)}), 기관 {io_:+,.0f}억"
+                    f"({side(io_)}), 개인 {pe:+,.0f}억({side(pe)})입니다.")
+            if len(sellers) == 2 and len(buyers) == 1:
+                line += f" {'·'.join(sellers)}가 판 물량을 {buyers[0]}이 받아냈습니다."
+            out.append(line)
+
+    # 4) 업종 자금 이동
+    st = data.get("strongest_sectors") or []
+    wk = data.get("weakest_sector")
+    if st and wk:
+        out.append(f"업종은 {st[0]['sector']}({_pct(st[0]['chg_pct_d'])})가 가장 강했고 "
+                   f"{wk['sector']}({_pct(wk['chg_pct_d'])})가 가장 약했습니다.")
+
+    # 5) 환율
+    fx = idx.get("원/달러 환율")
+    if fx and fx.get("close") is not None and fx.get("chg_pct_d") is not None:
+        out.append(f"원/달러 환율은 {fx['close']:,.2f}원({_pct(fx['chg_pct_d'])})입니다.")
+    return out
+
+
 def build_kr_fallback_brief(data, reason=None, failed=True):
     """Claude 호출이 실패했을 때의 수치 위주 브리핑.
 
@@ -690,6 +770,13 @@ def build_kr_fallback_brief(data, reason=None, failed=True):
     else:
         L = ["📊 <b>수치 요약본</b> <i>(해설 생성을 끄도록 설정되어 있습니다)</i>"]
     L += ["", f"🇰🇷 <b>한국 증시 마감 브리핑 — {data['session_date']}</b>", ""]
+
+    narr = build_kr_narrative(data)
+    if narr:
+        L.append("<b>⓪ 오늘의 시장</b> <i>(관측값으로 자동 작성 — AI 해설 아님)</i>")
+        for line in narr:
+            L.append(f"· {line}")
+        L.append("")
 
     L.append("<b>① 지수·환율</b>")
     for r in data["indices"]:
@@ -736,23 +823,45 @@ def build_kr_fallback_brief(data, reason=None, failed=True):
         stale = basis and not f.get("basis_matches_session")
         L.append("<b>⑦ 수급</b> <i>(억원, 순매수 기준"
                  + (f" · {basis} 집계)</i>" if stale else ")</i>"))
+        # ★ 날짜별로 묶어서 낸다 (2026-09-30). 종전에는 전부 한 덩어리로 찍고 날짜는
+        #   맨 아래 각주에만 뒀다. 그러면 기준일이 다른 두 묶음이 나란히 놓여 산술이
+        #   깨진 것처럼 보인다 - 2026-09-29 발송분에서 '개인 순매수 상위 5 합
+        #   +32,926억'이 '시장 전체 개인 +11,925억'보다 커졌다. 계산은 맞았고
+        #   앞의 것이 9/28, 뒤의 것이 9/29 였을 뿐인데, 날짜가 각주로 밀려 있어
+        #   독자에게는 데이터 오류로 읽힌다. 날짜는 숫자 옆에 있어야 한다.
+        fb = f.get("foreign_basis_date")
+        iib = f.get("institution_individual_basis_date")
+
+        if fb:
+            L.append(f"<b>[{fb} 기준]</b>")
         for mkt, t in (f.get("market_totals") or {}).items():
             L.append(f"· {mkt} 전체: 외국인 {t.get('foreign', 0):+,.0f} / "
                      f"기관 {t.get('institution', 0):+,.0f} / "
                      f"개인 {t.get('individual', 0):+,.0f}")
-        for who, bkey, skey in (("외국인", "foreign_top_buy", "foreign_top_sell"),
-                                ("기관", "institution_top_buy", "institution_top_sell"),
-                                ("개인", "individual_top_buy", "individual_top_sell")):
-            for tag, key in (("순매수", bkey), ("순매도", skey)):
-                rows = f.get(key) or []
-                if rows:
-                    L.append(f"· {who} {tag}: " + " · ".join(
-                        f"{r['name']} {r['net_eok']:+,.0f}" for r in rows))
-        iib = f.get("institution_individual_basis_date")
-        note = "기관·개인 순위는 시총 상위 종목 모집단의 추정치입니다 (외국인만 전 종목 기준)."
-        if iib and iib != f.get("foreign_basis_date"):
-            note += f" 기관·개인은 {iib} 세션 기준입니다(종목별 확정 수급은 당일치가 없습니다)."
-        L.append(f"<i>{note}</i>")
+        for tag, key in (("순매수", "foreign_top_buy"), ("순매도", "foreign_top_sell")):
+            rows = f.get(key) or []
+            if rows:
+                L.append(f"· 외국인 {tag}: " + " · ".join(
+                    f"{r['name']} {r['net_eok']:+,.0f}" for r in rows))
+
+        io_rows = [(who, bk, sk) for who, bk, sk in
+                   (("기관", "institution_top_buy", "institution_top_sell"),
+                    ("개인", "individual_top_buy", "individual_top_sell"))
+                   if f.get(bk) or f.get(sk)]
+        if io_rows:
+            if iib and iib != fb:
+                L.append(f"<b>[{iib} 기준]</b> <i>종목별 확정 수급은 당일치가 공시되지 "
+                         f"않아 직전 세션입니다. 위 숫자와 날짜가 다르니 서로 더하지 마십시오.</i>")
+            elif iib:
+                L.append(f"<b>[{iib} 기준]</b>")
+            for who, bkey, skey in io_rows:
+                for tag, key in (("순매수", bkey), ("순매도", skey)):
+                    rows = f.get(key) or []
+                    if rows:
+                        L.append(f"· {who} {tag}: " + " · ".join(
+                            f"{r['name']} {r['net_eok']:+,.0f}" for r in rows))
+        L.append("<i>기관·개인 순위는 시총 상위 종목 모집단의 추정치입니다 "
+                 "(외국인만 전 종목 기준).</i>")
         for w in (f.get("warnings") or [])[:3]:
             L.append(f"<i>· {w}</i>")
         L.append("")
