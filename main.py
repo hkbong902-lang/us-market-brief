@@ -794,6 +794,26 @@ _RATES = {
 }
 
 
+def error_reason(e, limit=400):
+    """예외에서 사람이 읽을 사유를 뽑는다.
+
+    ★ requests 가 raise_for_status 로 올린 예외에는 응답 객체가 붙어 있고, 진짜 사유는
+      상태줄이 아니라 그 본문에 있다. Anthropic 은 크레딧 소진을 400 + 본문
+      "Your credit balance is too low..." 로 돌려주므로, 상태코드만 보고하면 결제
+      문제와 요청 오류가 같은 문장("400 Client Error")으로 보여 진단이 한 단계 늦는다.
+
+    ★ 이 함수를 따로 둔 이유 (2026-09-30): 같은 처리가 kr_main 에만 복사돼 있고
+      main 에는 없었다. 크레딧이 소진된 날 KR 은 사유를 알려주고 US 는 '400'만
+      알려주는 상태였다. 복사본은 한쪽만 고쳐지므로, 한 곳에 두고 둘이 부른다.
+    """
+    body = getattr(getattr(e, "response", None), "text", "") or ""
+    try:
+        body = json.loads(body).get("error", {}).get("message", "") or body
+    except Exception:
+        pass
+    return (f"{e} — {body}" if body else str(e))[:limit]
+
+
 def _accumulate_usage(total, u):
     """이어쓰기로 여러 번 호출될 수 있으므로 호출별 usage 를 합산한다."""
     for k, v in (u or {}).items():
@@ -1214,8 +1234,8 @@ def main():
     try:
         brief = build_brief_with_claude(data)
     except Exception as e:
-        reason = str(e)[:400]
-        print(f"Claude API 실패 → 기본 브리핑으로 대체: {e}", file=sys.stderr)
+        reason = error_reason(e)
+        print(f"Claude API 실패 → 기본 브리핑으로 대체: {reason}", file=sys.stderr)
     if not brief:
         brief = build_fallback_brief(data, reason, failed=not skipped)
 

@@ -33,6 +33,7 @@ from main import (
     run_claude_brief,
     send_telegram,
     session_is_current,
+    error_reason,
 )
 
 KR_INDICES = {
@@ -803,15 +804,7 @@ def main():
         if not brief and not skipped:
             reason = "ANTHROPIC_API_KEY 미설정 또는 빈 응답"
     except Exception as e:
-        # requests가 raise_for_status로 올린 예외에는 응답 객체가 붙어 있고, 사유는
-        # 상태줄이 아니라 그 본문에 있다("credit balance is too low" 등). 상태코드만
-        # 보고하면 결제 문제와 요청 오류가 같은 문장으로 보여 진단이 한 단계 늦어진다.
-        body = getattr(getattr(e, "response", None), "text", "") or ""
-        try:
-            body = json.loads(body).get("error", {}).get("message", "") or body
-        except Exception:
-            pass
-        reason = (f"{e} — {body}" if body else str(e))[:400]
+        reason = error_reason(e)
         print(f"Claude API 실패 → 기본 브리핑으로 대체: {reason}", file=sys.stderr)
     if not brief:
         brief = build_kr_fallback_brief(data, reason, failed=not skipped)

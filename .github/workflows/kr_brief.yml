@@ -99,8 +99,16 @@ jobs:
           FORCE_SEND: ${{ inputs.force_send && '1' || '0' }}
           # USE_CLAUDE=0 이면 Claude 를 호출하지 않고 결정론적 수치 브리핑만 보낸다.
           # 비용이 0 이 되고, 머리말에 '수치 요약본' 표시가 붙어 장애와 구별된다.
-          # schedule 실행에는 inputs 가 없으므로 항상 '1' 이다(평소 동작).
-          USE_CLAUDE: ${{ inputs.no_ai && '0' || '1' }}
+          #
+          # 우선순위: no_ai 입력(1회성) > 저장소 변수 USE_CLAUDE(상시) > '1'(기본).
+          # ★ 저장소 변수를 끼운 이유 (2026-09-30): 정시 발송은 로컬 스케줄러가
+          #   inputs 없이 dispatch 하고 크론에도 inputs 가 없다. 그래서 inputs 만
+          #   보면 정시 경로를 끌 방법이 아예 없었다. 크레딧 소진처럼 '당분간 해설을
+          #   끄고 싶은' 상황에서 매 발송이 ⚠️ 장애 머리말을 달고 나가게 된다.
+          #   변수는 코드 수정 없이 켜고 끈다:  gh variable set USE_CLAUDE --body 0
+          #   되돌릴 때:                        gh variable set USE_CLAUDE --body 1
+          #   (변수를 지워도 기본값 '1' 로 돌아간다)
+          USE_CLAUDE: ${{ inputs.no_ai && '0' || vars.USE_CLAUDE || '1' }}
           # 종목마다 '왜 움직였는가' 1줄을 붙이는 구성이라 미국편(5회)보다 검색을 더 쓴다.
           KR_WEB_SEARCH_MAX_USES: "10"
           # CLAUDE_MODEL: claude-sonnet-5
