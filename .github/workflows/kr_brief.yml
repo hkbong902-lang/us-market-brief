@@ -41,7 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     # 2026-09-10 실측 12m26s. 검색을 10회까지 쓰는 구성이라 날에 따라 더 걸린다.
     # 15분이면 여유가 2분 30초뿐이고, 넘기면 브리핑이 통째로 누락된다.
-    timeout-minutes: 30
+    # ★ 잡 전체는 아래 '20:30 대기' 스텝(최대 5시간 30분)을 덮도록 크게 잡고, 생성 자체의
+    #   상한 30분은 Build & send 스텝에 따로 건다.
+    timeout-minutes: 360
     permissions:
       contents: read
       actions: read          # 오늘 이미 성공한 실행이 있는지 조회하기 위해 필요
@@ -92,8 +94,31 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
+      # ★ 15:00~20:30 KST 에 시작한 실행은 20:30 까지 기다린다 (2026-10-25).
+      #   브리핑은 KRX 정규장 종가 기준이라 넥스트레이드 애프터마켓(~20:00)이 끝난 뒤에
+      #   만들어야 한다. 그런데 로컬 작업 'KR Market Brief Dispatch' 의 트리거는 Windows
+      #   암호가 있어야 바꿀 수 있어 17:35 에 남아 있었다. 호출 시각에 기대지 않고 여기서
+      #   시각을 보장한다 - 로컬 작업이 20:30 이면 이 스텝은 그냥 지나간다.
+      #   15:00 하한: 자정을 넘겨 늦게 발화한 백업 크론(예: 01:30)이 다음 날 20:30 까지
+      #   잠들지 않게 한다. force_send(수동 테스트)는 기다리지 않는다.
+      - name: 20:30 KST 까지 대기 (애프터마켓 종료 후 KRX 종가 기준)
+        if: steps.guard.outputs.skip != 'true' && !inputs.force_send
+        timeout-minutes: 335
+        run: |
+          now=$(date +%s)
+          target=$(TZ=Asia/Seoul date -d 'today 20:30' +%s)
+          floor=$(TZ=Asia/Seoul date -d 'today 15:00' +%s)
+          if [ "$now" -ge "$floor" ] && [ "$now" -lt "$target" ]; then
+            w=$((target - now))
+            echo "KST $(TZ=Asia/Seoul date +%H:%M) 시작 → 20:30 까지 ${w}초 대기"
+            sleep "$w"
+          else
+            echo "KST $(TZ=Asia/Seoul date +%H:%M) 시작 → 대기 없음"
+          fi
+
       - name: Build & send KR brief
         if: steps.guard.outputs.skip != 'true'
+        timeout-minutes: 30
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
