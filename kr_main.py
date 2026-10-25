@@ -244,7 +244,7 @@ def check_krx_close_basis(session_date):
 # ── 수급(투자자별 매매동향) ──────────────────────────────────────────────────
 # 소스가 셋이다. 하나로는 원하는 모양이 안 나온다.
 #   (1) index/{market}/trend   시장 전체 3주체 순매수(억원). 네이버 확정 집계치.
-#   (2) trendForeignOrg        외국인 종목별 순매수·순매도 상위. 모집단이 전 종목.
+#   (2) trendForeignOrg        외국인·기관 종목별 순매수·순매도 상위(당일 가집계). 모집단이 전 종목.
 #   (3) stock/{code}/trend     종목별 외국인·기관·개인 순매수 '수량' + 종가.
 #
 # ★ 연기금이 없는 이유: 연기금은 기관의 하위 분류라 네이버가 공개하지 않는다.
@@ -268,8 +268,9 @@ def check_krx_close_basis(session_date):
 #     계좌와 키를 갖고 있으나 2026-09-20 기준 접속 불가 상태라 보류했다.
 #   - 가집계(추정)라는 점은 그대로 표기해야 한다.
 #
-# ★ 기관·개인에만 모집단 한정이 붙는 이유: (2) 같은 순위 API 가 외국인에만 있다.
-#   기관·개인은 (3)을 종목마다 불러 직접 순위를 매겨야 하는데 상장 종목이 4,300 개라
+# ★ 개인에만 모집단 한정이 붙는 이유: (2) 같은 순위 API 가 외국인·기관에만 있다
+#   (investorType=FOREIGNER|ORGANIZATION, 2026-10-25 확인 - 그 전에는 기관도 여기 있었다).
+#   개인은 (3)을 종목마다 불러 직접 순위를 매겨야 하는데 상장 종목이 4,300 개라
 #   전수는 현실적이지 않다(시총 상위 190 개로 7 초). 그래서 시총 상위로 모집단을
 #   한정하고 그 사실을 데이터에 실어, '전 종목 1위'라고 잘못 말하지 못하게 한다.
 FLOW_POOL_N = int(os.environ.get("KR_FLOW_POOL_N", "100"))   # 시장별 시총 상위 N
@@ -286,15 +287,23 @@ def naver_market_flow(market):
             "individual": _num(j.get("personalValue"))}
 
 
-def naver_foreign_rank(market):
-    """외국인 종목별 순매수·순매도 상위. 모집단은 그 시장 전 종목.
+def naver_investor_rank(market, investor="FOREIGNER"):
+    """외국인 또는 기관의 종목별 순매수·순매도 상위(당일 가집계). 모집단은 그 시장 전 종목.
 
-    ★ 이름이 trendForeignOrg 라 '외국인+기관 합산'으로 읽히지만 외국인 단독이다.
-      2026-09-18 SK하이닉스의 accTradeVolume=723470 이 stock/000660/trend 의
-      foreignerPureBuyQuant=+723,470 과 정확히 일치한다(같은 날 기관은 +160,742 로
-      다르다). 합산이었다면 둘 중 어느 쪽과도 맞지 않는다.
+    ★ 이름이 trendForeignOrg 라 '외국인+기관 합산'으로 읽히지만 합산이 아니다.
+      investorType 이 FOREIGNER(기본값) | ORGANIZATION 중 하나를 고른다 - 파라미터를
+      틀리게 주면 400 응답이 허용값을 알려준다(2026-10-25 확인). 종전에는 이 파라미터를
+      몰라서 '기관용 같은-날 순위는 없다'고 결론 내리고 기관을 직전 세션 종목별 수급으로
+      대신했다.
+      검증: 2026-09-18 SK하이닉스 FOREIGNER accTradeVolume=723470 = stock/000660/trend
+      foreignerPureBuyQuant. 2026-10-23 ORGANIZATION 상위 5종목(SK하이닉스 483193,
+      삼성전자 627670 …)이 organPureBuyQuant 와 수량까지 전부 일치.
+      개인은 허용값에 없다 - 같은-날 개인 순위는 이 엔드포인트로 받을 수 없다.
+    ★ tradeType=KRX 로 고정한다. 브리핑은 15:30 KRX 정규장 기준이다(NXT 제외).
     """
-    r = requests.get(FOREIGN_RANK_URL, params={"marketType": market},
+    r = requests.get(FOREIGN_RANK_URL,
+                     params={"marketType": market, "investorType": investor,
+                             "tradeType": "KRX"},
                      headers={"User-Agent": UA["User-Agent"],
                               "Accept": "application/json",
                               "Referer": "https://stock.naver.com/"}, timeout=20)
@@ -305,6 +314,10 @@ def naver_foreign_rank(market):
         out = []
         for x in sec.get(key) or []:
             if not x.get("itemname"):
+                continue
+            # type 은 ST(주식) / EF(ETF). 코스피 기관 상위 40개 중 14개가 KODEX 200 류
+            # ETF 였다(2026-10-23). 다른 블록과 같이 ETP 는 뺀다.
+            if EXCLUDE_ETP and x.get("type") not in (None, "ST"):
                 continue
             # ★ 장 마감 직후의 가집계 응답은 accTradeAmount 가 통째로 0 이다 (2026-09-28).
             #   수량(accTradeVolume)과 현재가(nowPrice)는 정상으로 오므로 금액을 되살린다.
@@ -332,7 +345,7 @@ def naver_foreign_rank(market):
 
 
 def naver_cap_pool(market, n):
-    """시총 상위 n 종목. 기관·개인 순위의 모집단."""
+    """시총 상위 n 종목. 개인 순위의 모집단."""
     out, page = [], 1
     while len(out) < n and page <= 5:
         j = _api(f"stocks/marketValue/{market}", page=page, pageSize=PAGE_MAX)
@@ -384,39 +397,47 @@ def collect_kr_flows(session_date):
         if t.get("bizdate") and t["bizdate"] != want:
             warn.append(f"{label} 수급 집계일({t['bizdate']})이 세션({want})과 다르다")
 
-    # 외국인 - 전 종목 순위. 두 시장을 합쳐 금액순으로 다시 세운다.
-    fb, fs = [], []
-    for market in ("KOSPI", "KOSDAQ"):
-        try:
-            b, s = naver_foreign_rank(market)
-            fb += b
-            fs += s
-        except Exception as e:
-            warn.append(f"{market} 외국인 순위 수집 실패: {e}")
-    fb.sort(key=lambda r: -r["net_eok"])
-    fs.sort(key=lambda r: r["net_eok"])
-    # 네이버가 잠정치에 estimated=true 를 붙인다. 17:30 실행은 장 마감 두 시간 뒤라
-    # 확정 집계 전일 수 있다. 잠정이면 그 사실을 드러낸다 - 확정치와 같은 얼굴로
-    # 도착하면 나중에 숫자가 바뀌어도 아무도 모른다.
-    if any(r.get("estimated") for r in fb + fs):
-        warn.append("외국인 수급이 잠정치다(장 마감 직후 집계). 확정치와 다를 수 있다")
+    # 외국인·기관 - 전 종목 당일 순위. 두 시장을 합쳐 금액순으로 다시 세운다.
+    ranks, rank_dates = {}, {}
+    for inv, label in (("FOREIGNER", "외국인"), ("ORGANIZATION", "기관")):
+        rb, rs = [], []
+        for market in ("KOSPI", "KOSDAQ"):
+            try:
+                b, s = naver_investor_rank(market, inv)
+                rb += b
+                rs += s
+            except Exception as e:
+                warn.append(f"{market} {label} 순위 수집 실패: {e}")
+        rb.sort(key=lambda r: -r["net_eok"])
+        rs.sort(key=lambda r: r["net_eok"])
+        ranks[inv] = (rb, rs)
+        ds = {r["bizdate"] for r in rb + rs if r.get("bizdate")}
+        rank_dates[inv] = max(ds) if ds else None
+        if rank_dates[inv] and rank_dates[inv] != want:
+            warn.append(f"{label} 순위 집계일({rank_dates[inv]})이 세션({want})과 다르다")
+        # 네이버가 잠정치에 estimated=true 를 붙인다. 장 마감 직후라 확정 집계 전일 수
+        # 있다. 잠정이면 그 사실을 드러낸다 - 확정치와 같은 얼굴로 도착하면 나중에
+        # 숫자가 바뀌어도 아무도 모른다.
+        if any(r.get("estimated") for r in rb + rs):
+            warn.append(f"{label} 수급이 잠정치다(장 마감 직후 집계). 확정치와 다를 수 있다")
+    fb, fs = ranks["FOREIGNER"]
+    ib, isell = ranks["ORGANIZATION"]
 
-    # 기관·개인 - 시총 상위 모집단에서 직접 순위를 만든다.
+    # 개인 - 시총 상위 모집단에서 직접 순위를 만든다.
     pool = []
     for market in ("KOSPI", "KOSDAQ"):
         try:
             pool += naver_cap_pool(market, FLOW_POOL_N)
         except Exception as e:
             warn.append(f"{market} 시총 상위 모집단 수집 실패: {e}")
-    # ★ 종목별 확정 수급(stock/{code}/trend)은 당일치가 없다 (2026-09-28 확인).
-    #   17:35 은 물론 19:00 에도 최신 bizdate 가 '직전 세션'이다. 종전 코드는 당일
+    # ★ 종목별 확정 수급(stock/{code}/trend)은 당일치가 늦게 올라온다 (2026-09-28 확인).
+    #   17:35 은 물론 19:00 에도 최신 bizdate 가 '직전 세션'이었다. 종전 코드는 당일
     #   세션과 일치하는 행만 받아서, 모집단 200종목이 200종목 모두 탈락했고 기관·개인
     #   순위가 통째로 사라졌다. 사용자에게는 "제공되지 않았다"로 나갔다.
-    #   당일치가 원래 없는 것이므로 '가장 최근 가용 세션'으로 물러나되, 그 기준일을
-    #   외국인(당일 가집계)과 별도로 표기해 두 블록의 날짜가 다르다는 것을 드러낸다.
-    #   ★ 같은-날 기관·개인 종목 순위는 네이버에 존재하지 않는다. 가집계는 외국인
-    #     전용이고(trendForeignOrg), 기관용 형제 엔드포인트도 전환 파라미터도 없다.
-    #     한투 KIS 의 '국내기관_외국인 매매종목가집계'가 이 구멍을 메운다.
+    #   그래서 '가장 최근 가용 세션'으로 물러나되, 그 기준일을 따로 표기한다.
+    #   ★ 기관은 2026-10-25 부터 위의 당일 순위(investorType=ORGANIZATION)로 옮겼다.
+    #     이 경로에 남은 것은 개인뿐이다 - 같은-날 개인 종목 순위 소스는 아직 없다.
+    #     20:30 실행에서 당일치가 잡히면 아래 로직이 그대로 당일 기준으로 낸다.
     rows, skipped, seen_dates = [], 0, {}
     for code, name, market in pool:
         try:
@@ -430,7 +451,6 @@ def collect_kr_flows(session_date):
         seen_dates[f["bizdate"]] = seen_dates.get(f["bizdate"], 0) + 1
         rows.append({"name": name, "code": code, "market": market,
                      "bizdate": f["bizdate"],
-                     "institution_eok": round((f["institution_q"] or 0) * f["close"] / 1e8),
                      "individual_eok": round((f["individual_q"] or 0) * f["close"] / 1e8)})
     stock_basis = None
     if seen_dates:
@@ -439,43 +459,45 @@ def collect_kr_flows(session_date):
         dropped = [r for r in rows if r["bizdate"] != stock_basis]
         rows = [r for r in rows if r["bizdate"] == stock_basis]
         if dropped:
-            warn.append(f"기관·개인 모집단 중 {len(dropped)}종목은 기준일이 달라 제외")
+            warn.append(f"개인 모집단 중 {len(dropped)}종목은 기준일이 달라 제외")
     if skipped:
-        warn.append(f"기관·개인 모집단 {len(pool)}종목 중 {skipped}종목은 수급 데이터가 없어 제외")
+        warn.append(f"개인 모집단 {len(pool)}종목 중 {skipped}종목은 수급 데이터가 없어 제외")
     if stock_basis and stock_basis != want:
-        warn.append(f"기관·개인 종목 순위는 당일치가 공시되지 않아 직전 세션({stock_basis}) 기준이다")
+        warn.append(f"개인 종목 순위는 당일치가 아직 공시되지 않아 직전 세션({stock_basis}) 기준이다")
 
     def top(key, sign):
         ranked = sorted(rows, key=lambda r: -sign * r[key])[:FLOW_RANK_N]
         return [{"name": r["name"], "market": r["market"], "net_eok": r[key]}
                 for r in ranked if sign * r[key] > 0]
 
+    def iso(d):
+        return f"{d[:4]}-{d[4:6]}-{d[6:]}" if d and len(d) == 8 else d
+
     n = FLOW_RANK_N
     return strip_none({
-        "basis_date": (f"{biz[:4]}-{biz[4:6]}-{biz[6:]}" if biz and len(biz) == 8 else biz),
+        "basis_date": iso(biz),
         "basis_matches_session": (biz == want) if biz else None,
         "unit": "억원(순매수 기준, 음수는 순매도)",
         "market_totals": totals or None,
         "foreign_top_buy": fb[:n] or None,
         "foreign_top_sell": fs[:n] or None,
-        "institution_top_buy": top("institution_eok", 1) or None,
-        "institution_top_sell": top("institution_eok", -1) or None,
+        "institution_top_buy": ib[:n] or None,
+        "institution_top_sell": isell[:n] or None,
         "individual_top_buy": top("individual_eok", 1) or None,
         "individual_top_sell": top("individual_eok", -1) or None,
-        "foreign_universe": "코스피·코스닥 전 종목",
-        "foreign_basis_date": (f"{biz[:4]}-{biz[4:6]}-{biz[6:]}"
-                               if biz and len(biz) == 8 else biz),
-        "institution_individual_basis_date":
-            (f"{stock_basis[:4]}-{stock_basis[4:6]}-{stock_basis[6:]}"
-             if stock_basis and len(stock_basis) == 8 else stock_basis),
-        "institution_individual_universe":
+        "foreign_universe": "코스피·코스닥 전 종목(ETF 제외)",
+        "institution_universe": "코스피·코스닥 전 종목(ETF 제외)",
+        "foreign_basis_date": iso(biz),
+        "institution_basis_date": iso(rank_dates["ORGANIZATION"]),
+        "individual_basis_date": iso(stock_basis),
+        "individual_universe":
             f"코스피·코스닥 시총 상위 각 {FLOW_POOL_N}종목 중에서만 순위를 매겼다",
-        "institution_individual_estimated":
-            ("기관·개인 금액은 순매수 수량 × 종가로 환산한 추정치다. 또한 종목별 확정 수급은 "
-             "당일치가 공시되지 않으므로 institution_individual_basis_date 가 외국인 기준일과 "
+        "individual_estimated":
+            ("개인 금액은 순매수 수량 × 종가로 환산한 추정치다. 또한 종목별 확정 수급은 "
+             "당일치가 늦게 공시되므로 individual_basis_date 가 외국인·기관 기준일과 "
              "다를 수 있다 - 다르면 반드시 그 날짜를 밝힐 것."),
         "foreign_amount_note":
-            ("외국인 금액은 장 마감 직후 가집계라 거래소 집계 금액이 비어 있는 경우가 있다. "
+            ("외국인·기관 금액은 장 마감 직후 가집계라 거래소 집계 금액이 비어 있는 경우가 있다. "
              "그때는 순매수 수량 × 현재가로 환산한 값이다(amount_derived=true)."),
         "pension_unavailable":
             "연기금은 제공 소스가 없어 이 브리핑에 없다. 연기금을 언급하지 말 것.",
@@ -627,8 +649,8 @@ def collect_kr_market_data():
             "*_universe": "순위를 매긴 모집단 크기(그 시장의 전 종목 수).",
             "investor_flows": ("투자자별 수급. 단위는 억원이고 순매수 기준이라 음수는 "
                                "순매도다. market_totals 는 시장 전체 확정 집계, "
-                               "*_top_buy/*_top_sell 은 종목별 순위다. 외국인은 전 종목이 "
-                               "모집단이지만 기관·개인은 시총 상위로 한정된 모집단에서 "
+                               "*_top_buy/*_top_sell 은 종목별 순위다. 외국인·기관은 전 종목이 "
+                               "모집단이지만 개인은 시총 상위로 한정된 모집단에서 "
                                "매긴 순위이며 금액도 추정치다 - 그 한계를 그대로 밝힐 것."),
             "min_market_cap_filter_eok": "0이면 시가총액 필터 없이 순수 등락률 순위다.",
             "market_cap_eok": "시가총액(억원).",
@@ -708,7 +730,7 @@ KR_SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데�
   ⑦ 수급 — 오늘 누가 사고 누가 팔았나 (브리핑의 마지막 블록)
      investor_flows 로 쓴다. 단위는 억원이고 순매수 기준이므로 음수는 순매도다.
      ★★기준일이 다른 숫자를 한 묶음에 섞지 말 것. foreign_basis_date 와
-       institution_individual_basis_date 가 다르면 반드시 두 묶음으로 나누고,
+       individual_basis_date(또는 institution_basis_date)가 다르면 반드시 두 묶음으로 나누고,
        각 묶음 머리에 [YYYY-MM-DD 기준] 을 붙인다. 섞어 놓으면 독자가 두 묶음을
        더해 산술이 깨진 것으로 읽는다 - 2026-09-29 발송분에서 '개인 순매수 상위
        합'이 '시장 전체 개인'보다 커져 데이터 오류로 오인됐다(실제로는 날짜가
@@ -717,17 +739,17 @@ KR_SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데�
          - 시장 전체: 코스피·코스닥 각각 외국인·기관·개인 순매수를 한 줄씩.
          - 외국인 순매수 상위 5 / 순매도 상위 5. 형식:
              순매수 <b>SK하이닉스</b> +13,309억 · <b>가온전선</b> +1,094억 · …
-     (b) [institution_individual_basis_date 기준] 묶음
-         - 기관 순매수·순매도 상위 5, 개인 순매수·순매도 상위 5를 같은 형식으로.
-         - 두 기준일이 다르면 이 묶음 머리에 '날짜가 달라 위 숫자와 더할 수 없다'는
-           취지를 한 줄로 밝힌다.
+         - 기관 순매수·순매도 상위 5를 같은 형식으로(institution_basis_date 가 같을 때).
+         - 개인 순매수·순매도 상위 5도 individual_basis_date 가 같으면 여기에 넣는다.
+     (b) 기준일이 foreign_basis_date 와 다른 주체(보통 개인)만 따로 [그 날짜 기준]
+         묶음으로 내고, 머리에 '날짜가 달라 위 숫자와 더할 수 없다'는 취지를 한 줄로 밝힌다.
      (c) ★한계를 반드시 밝힐 것. 두 가지다.
-         - 기관·개인 순위는 시총 상위 종목만 모집단이고 금액도 추정치다. 이 말이
-           빠지면 독자는 '전 종목 1위'로 읽는다 — 외국인만 전 종목 기준이다.
-         - ★institution_individual_basis_date 가 foreign_basis_date 와 다르면,
-           기관·개인 순위가 '직전 세션(그 날짜) 기준'임을 반드시 명시할 것. 종목별
-           확정 수급은 당일치가 공시되지 않아 하루 늦는 것이 정상이다. 두 날짜를
-           섞어 읽으면 '오늘 기관이 이걸 샀다'는 틀린 문장이 만들어진다.
+         - 개인 순위는 시총 상위 종목만 모집단이고 금액도 추정치다. 이 말이
+           빠지면 독자는 '전 종목 1위'로 읽는다 — 외국인·기관은 전 종목 기준이다.
+         - ★individual_basis_date 가 foreign_basis_date 와 다르면, 개인 순위가
+           '직전 세션(그 날짜) 기준'임을 반드시 명시할 것. 종목별 확정 수급은
+           당일치가 늦게 올라온다. 두 날짜를 섞어 읽으면 '오늘 개인이 이걸 샀다'는
+           틀린 문장이 만들어진다.
      (d) 마지막 2~3문장으로 해석한다. 세 주체의 방향이 엇갈렸는지, 지수를 끌어올린
          주체가 누구인지, 그리고 ②~⑤에서 본 업종·종목과 수급이 같은 이야기를 하는지.
      ★연기금 데이터는 제공되지 않는다. 연기금을 언급하지 말 것.
@@ -920,38 +942,38 @@ def build_kr_fallback_brief(data, reason=None, failed=True):
         #   앞의 것이 9/28, 뒤의 것이 9/29 였을 뿐인데, 날짜가 각주로 밀려 있어
         #   독자에게는 데이터 오류로 읽힌다. 날짜는 숫자 옆에 있어야 한다.
         fb = f.get("foreign_basis_date")
-        iib = f.get("institution_individual_basis_date")
 
+        def rank_lines(who, bkey, skey):
+            for tag, key in (("순매수", bkey), ("순매도", skey)):
+                rows = f.get(key) or []
+                if rows:
+                    L.append(f"· {who} {tag}: " + " · ".join(
+                        f"{r['name']} {r['net_eok']:+,.0f}" for r in rows))
+
+        # 주체별 기준일. 외국인 기준일과 같은 주체는 첫 묶음에 넣고, 다른 주체만 따로 묶는다.
+        who_rows = [(who, bk, sk, f.get(dk)) for who, bk, sk, dk in
+                    (("외국인", "foreign_top_buy", "foreign_top_sell", "foreign_basis_date"),
+                     ("기관", "institution_top_buy", "institution_top_sell",
+                      "institution_basis_date"),
+                     ("개인", "individual_top_buy", "individual_top_sell",
+                      "individual_basis_date"))
+                    if f.get(bk) or f.get(sk)]
         if fb:
             L.append(f"<b>[{fb} 기준]</b>")
         for mkt, t in (f.get("market_totals") or {}).items():
             L.append(f"· {mkt} 전체: 외국인 {t.get('foreign', 0):+,.0f} / "
                      f"기관 {t.get('institution', 0):+,.0f} / "
                      f"개인 {t.get('individual', 0):+,.0f}")
-        for tag, key in (("순매수", "foreign_top_buy"), ("순매도", "foreign_top_sell")):
-            rows = f.get(key) or []
-            if rows:
-                L.append(f"· 외국인 {tag}: " + " · ".join(
-                    f"{r['name']} {r['net_eok']:+,.0f}" for r in rows))
-
-        io_rows = [(who, bk, sk) for who, bk, sk in
-                   (("기관", "institution_top_buy", "institution_top_sell"),
-                    ("개인", "individual_top_buy", "individual_top_sell"))
-                   if f.get(bk) or f.get(sk)]
-        if io_rows:
-            if iib and iib != fb:
-                L.append(f"<b>[{iib} 기준]</b> <i>종목별 확정 수급은 당일치가 공시되지 "
+        for who, bk, sk, d in who_rows:
+            if not d or d == fb:
+                rank_lines(who, bk, sk)
+        for who, bk, sk, d in who_rows:
+            if d and d != fb:
+                L.append(f"<b>[{d} 기준]</b> <i>{who} 종목별 수급은 당일치가 아직 공시되지 "
                          f"않아 직전 세션입니다. 위 숫자와 날짜가 다르니 서로 더하지 마십시오.</i>")
-            elif iib:
-                L.append(f"<b>[{iib} 기준]</b>")
-            for who, bkey, skey in io_rows:
-                for tag, key in (("순매수", bkey), ("순매도", skey)):
-                    rows = f.get(key) or []
-                    if rows:
-                        L.append(f"· {who} {tag}: " + " · ".join(
-                            f"{r['name']} {r['net_eok']:+,.0f}" for r in rows))
-        L.append("<i>기관·개인 순위는 시총 상위 종목 모집단의 추정치입니다 "
-                 "(외국인만 전 종목 기준).</i>")
+                rank_lines(who, bk, sk)
+        L.append("<i>개인 순위는 시총 상위 종목 모집단의 추정치입니다 "
+                 "(외국인·기관은 전 종목 기준, ETF 제외).</i>")
         for w in (f.get("warnings") or [])[:3]:
             L.append(f"<i>· {w}</i>")
         L.append("")
