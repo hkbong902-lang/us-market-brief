@@ -113,7 +113,10 @@ jobs:
           #   (변수를 지워도 기본값 '1' 로 돌아간다)
           USE_CLAUDE: ${{ inputs.no_ai && '0' || vars.USE_CLAUDE || '1' }}
           # 종목마다 '왜 움직였는가' 1줄을 붙이는 구성이라 미국편(5회)보다 검색을 더 쓴다.
-          KR_WEB_SEARCH_MAX_USES: "10"
+          # 저장소 변수로 코드 수정 없이 바꾼다:  gh variable set KR_WEB_SEARCH_MAX_USES --body 5
+          #   변수를 지우면 기본값 10 으로 돌아간다. 2026-10-25 10회 실측: 입력 153만 토큰,
+          #   약 $3.5, 생성 10분 - 비용 대부분은 검색 결과 본문이 맥락에 쌓이는 몫이다.
+          KR_WEB_SEARCH_MAX_USES: ${{ vars.KR_WEB_SEARCH_MAX_USES || '10' }}
           # CLAUDE_MODEL: claude-sonnet-5
           # USE_WEB_SEARCH: "1"
         run: python kr_main.py
