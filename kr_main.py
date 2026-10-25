@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""한국 증시 마감 브리핑 — KRX 정규장 마감(15:30 KST) 이후 17:30 KST 발송.
+"""한국 증시 마감 브리핑 — KRX 정규장 마감(15:30 KST) 기준, 20:30 KST 발송.
+
+발송이 20:30 인 이유 (2026-10-25): 네이버 시세 API 는 넥스트레이드(NXT) 애프터마켓이
+열려 있는 15:40~20:00 동안 '현재가'를 통합 실시간 시세로 준다. 17:35 에 돌던 시절의
+브리핑은 정규장 종가가 아니라 그 시각의 애프터마켓 가격으로 등락률·순위·업종을 매겼다
+(2026-10-23 삼성바이오로직스: 발송 +6.54% / KRX 종가 +7.27%, 업종 2위도 달랐다).
+애프터마켓이 끝난 뒤에는 같은 필드가 KRX 종가로 돌아온다. 그래서 실행을 그 뒤로 옮기고,
+실행 시점에 실제로 KRX 종가 기준인지 check_krx_close_basis 가 매번 확인한다.
 
 미국 브리핑(main.py)과는 발송 시점도 구성도 독립이다. 구성은 다음으로 고정한다.
   ① 지수·환율
   ② 코스피 당일 상승률 상위 10 (+종목별 1줄)
   ③ 코스닥 당일 상승률 상위 10 (+종목별 1줄)
-  ④ 당일 강세 업종 2개 (+업종 내 최강 3종목, 종목별 1줄)
-  ⑤ 당일 약세 업종 1개 (+업종 내 최약 3종목, 종목별 1줄)
+  ④ 당일 강세 업종 2개 (+업종 내 최강 3종목 + 시총 상위 3종목, 종목별 1줄)
+  ⑤ 당일 약세 업종 1개 (+업종 내 최약 3종목 + 시총 상위 3종목, 종목별 1줄)
   ⑥ 총평
 
 종목 유니버스를 손으로 고르지 않는다. '상승률 상위 10'과 '가장 강한 업종'은 시장 전체를
@@ -182,6 +189,56 @@ def naver_sector_members(no):
         print(f"업종 {no}: 구성종목 {total}개 중 {len(rows)}개만 받았습니다", file=sys.stderr)
     rows.sort(key=lambda x: x["chg_pct_d"], reverse=True)
     return rows
+
+
+def sector_cap_leaders(members, exclude=(), n=3):
+    """업종 내 시총 상위 n 종목. 등락률 상위·하위에 이미 나온 종목은 건너뛴다.
+
+    겹치는 종목을 그대로 두면 6줄 중 일부가 같은 종목의 반복이 된다. 건너뛰고 다음
+    순위로 채워 항상 서로 다른 종목을 보여준다(구성종목이 적으면 n 개보다 적을 수 있다).
+    """
+    skip = {r["code"] for r in exclude}
+    ranked = sorted((r for r in members if r.get("market_cap_eok") and r["code"] not in skip),
+                    key=lambda r: r["market_cap_eok"], reverse=True)
+    return ranked[:n]
+
+
+# 시세 기준 점검용 종목. 넥스트레이드에서도 거래되는 대형주라 애프터마켓 시세가 붙는다.
+PRICE_BASIS_PROBE = ("005930", "000660", "005380", "035420", "207940")
+
+
+def check_krx_close_basis(session_date):
+    """네이버 '현재가'가 KRX 정규장 종가인지 실행 시점에 확인한다. 경고 문구 또는 None.
+
+    필드 이름은 기준을 보증하지 않는다 - 같은 closePrice 가 애프터마켓 중에는 통합 실시간
+    시세다. 그래서 대형주 몇 개의 현재가를 KRX 일봉 종가(stock/{code}/price)와 대조한다.
+    하나라도 다르면 이 실행의 등락률·순위·업종은 KRX 종가 기준이 아니다. 수동 실행을
+    20:00 전에 돌리면 이 경고가 붙는 것이 정상이다.
+    """
+    diffs, checked = [], 0
+    for code in PRICE_BASIS_PROBE:
+        try:
+            basic = _api(f"stock/{code}/basic")
+            daily = _api(f"stock/{code}/price", page=1, pageSize=1)
+        except Exception as e:
+            print(f"시세 기준 점검 실패({code}): {e}", file=sys.stderr)
+            continue
+        day = daily[0] if daily else {}
+        if str(day.get("localTradedAt", ""))[:10] != session_date:
+            continue                      # 당일 일봉이 아직 없으면 판정하지 않는다
+        checked += 1
+        if _num(basic.get("closePrice")) != _num(day.get("closePrice")):
+            diffs.append(f"{basic.get('stockName', code)} 현재가 {basic.get('closePrice')}"
+                         f" ≠ KRX 종가 {day.get('closePrice')}")
+    if diffs:
+        msg = ("등락률이 KRX 정규장 종가 기준이 아닐 수 있습니다(넥스트레이드 애프터마켓 "
+               "시세 반영 추정) - " + "; ".join(diffs[:2]))
+        print(f"PRICE-BASIS-WARN {msg}", file=sys.stderr)
+        return msg
+    if not checked:
+        print("PRICE-BASIS-WARN KRX 종가 대조를 하나도 하지 못했습니다(판정 불가)",
+              file=sys.stderr)
+    return None
 
 
 # ── 수급(투자자별 매매동향) ──────────────────────────────────────────────────
@@ -469,6 +526,7 @@ def collect_kr_market_data():
         raise RuntimeError("코스피 지수 상태를 받지 못했습니다")
     t_date = datetime.fromisoformat(kospi["traded_at"]).date()
     market_status = kospi.get("market_status")
+    price_basis_warning = check_krx_close_basis(str(t_date))
 
     hist_idx = download_history(list(KR_INDICES.keys()), start=start)
     bench_close = hist_idx.get(BENCHMARK_KR, {}).get("close")
@@ -505,22 +563,28 @@ def collect_kr_market_data():
         tops[key] = picked
         tops[key + "_universe"] = universe
 
-    # 4)(5) 업종 — 강세 2개 / 약세 1개, 각 업종 구성종목 전체에서 최강·최약 3개.
+    # 4)(5) 업종 — 강세 2개 / 약세 1개, 각 업종 구성종목 전체에서 최강·최약 3개와
+    #    시총 상위 3개(대표 종목). 등락률 상위만 보면 소형주가 업종을 대표하는 것처럼
+    #    읽힌다 - 업종지수를 실제로 움직이는 대형주가 그날 어땠는지를 나란히 둔다.
     sectors = naver_sectors()
     strong, weak = [], None
     for no, name, chg, up, down, total in sectors[:2]:
         members = naver_sector_members(no)
         top3 = members[:3]
-        attach_trend(top3, bench)
+        reps = sector_cap_leaders(members, exclude=top3)
+        attach_trend(top3 + reps, bench)
         strong.append({"sector": name, "chg_pct_d": chg, "members": total or len(members),
-                       "up": up, "down": down, "top3_by_daily_change": top3})
+                       "up": up, "down": down, "top3_by_daily_change": top3,
+                       "top3_by_market_cap": reps})
     if sectors:
         no, name, chg, up, down, total = sectors[-1]
         members = naver_sector_members(no)
         bottom3 = members[-3:][::-1]
-        attach_trend(bottom3, bench)
+        reps = sector_cap_leaders(members, exclude=bottom3)
+        attach_trend(bottom3 + reps, bench)
         weak = {"sector": name, "chg_pct_d": chg, "members": total or len(members),
-                "up": up, "down": down, "bottom3_by_daily_change": bottom3}
+                "up": up, "down": down, "bottom3_by_daily_change": bottom3,
+                "top3_by_market_cap": reps}
 
     # 6) 수급 - 실패해도 브리핑을 막지 않는다. 나머지가 다 살아 있는데 수급 하나로
     #    전체를 떨구면, 고칠 수 있는 결함 하나가 그날의 침묵이 된다.
@@ -544,6 +608,7 @@ def collect_kr_market_data():
         "prev_session_date": str(t1_date),
         "generated_at_kst": now_kst.strftime("%Y-%m-%d %H:%M"),
         "market_status": market_status,
+        "price_basis_warning": price_basis_warning,
         "benchmark": strip_none({"ticker": BENCHMARK_KR, "name": "코스피(상대강도 기준)", **bench}),
         "indices": indices,
         **tops,
@@ -566,6 +631,10 @@ def collect_kr_market_data():
                                "모집단이지만 기관·개인은 시총 상위로 한정된 모집단에서 "
                                "매긴 순위이며 금액도 추정치다 - 그 한계를 그대로 밝힐 것."),
             "min_market_cap_filter_eok": "0이면 시가총액 필터 없이 순수 등락률 순위다.",
+            "market_cap_eok": "시가총액(억원).",
+            "top3_by_market_cap": ("업종 내 시가총액 상위 3종목(대표 종목). 같은 업종의 "
+                                   "등락률 상위·하위 3종목과 겹치는 종목은 빼고 다음 순위로 "
+                                   "채웠다."),
         },
         "note": ("kospi_top_gainers / kosdaq_top_gainers는 시가총액 상위가 아니라 "
                  "'당일 상승률 상위'다. 시장 전체를 모집단으로 하므로 소형주·상한가 종목이 "
@@ -618,14 +687,18 @@ KR_SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데�
   ④ 오늘 가장 강했던 업종 2개
      strongest_sectors의 2개를 순서대로. 각 업종마다:
        (a) <b>업종명</b> 헤더 한 줄 — 업종지수 등락률, 상승/하락 종목 수(전체 구성종목 수)
-       (b) 그 업종에서 가장 많이 오른 종목 3개(top3_by_daily_change)를 한 줄씩,
-           ②와 같은 '종목명 등락률 (20d) — 1줄 브리핑' 형식으로
+       (b) 종목 6개를 두 묶음으로, 각 묶음에 소제목을 붙여 한 줄씩.
+           ②와 같은 '종목명 등락률 (20d) — 1줄 브리핑' 형식으로:
+           ▸ 변동 상위: 그 업종에서 가장 많이 오른 종목 3개(top3_by_daily_change)
+           ▸ 대표 종목(시총 상위): top3_by_market_cap 3개. 업종지수를 실제로 움직이는
+             대형주가 오늘 업종 흐름을 따라갔는지, 소형주만 오른 것인지 드러나게 쓴다.
        (c) 이 업종이 오늘 왜 강했는지 2~3문장. 마지막 문장은 반드시 추세 판단
            (20일 추세의 연장인가, 낙폭과대 반등인가)으로 끝낸다.
 
   ⑤ 오늘 가장 약했던 업종 1개
-     weakest_sector를 ④와 똑같은 (a)(b)(c) 구조로. 단 (b)는 그 업종에서 가장 많이 내린
-     종목 3개(bottom3_by_daily_change)를 쓴다. (c)에서는 왜 같은 날 같은 방향으로 팔렸는지를
+     weakest_sector를 ④와 똑같은 (a)(b)(c) 구조로. 단 (b)의 '변동 상위'는 그 업종에서
+     가장 많이 내린 종목 3개(bottom3_by_daily_change)를 쓰고, '대표 종목'은 똑같이
+     top3_by_market_cap 3개를 쓴다. (c)에서는 왜 같은 날 같은 방향으로 팔렸는지를
      업황·수급·자금 이동으로 설명하고, 이 하락이 '추세 안의 조정'인지 '추세 이탈'인지를
      200일선 대비 위치와 20d 수익률로 구분해 명시한다.
 
@@ -662,6 +735,8 @@ KR_SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데�
        그 날짜를 밝히고 넘어간다.
      ★warnings 나 error 가 있으면 그 사실을 한 줄로 적는다. 조용히 넘어가지 말 것.
 
+- ★price_basis_warning 이 있으면 브리핑 맨 첫 줄에 그 내용을 한 줄로 밝힌다. 이날의 종목
+  등락률·순위·업종이 KRX 정규장 종가 기준이 아닐 수 있다는 뜻이다.
 - 제공된 수치를 임의로 바꾸지 말 것. 없는 수치는 만들지 말 것.
 - 마지막에 '투자 권유가 아닌 정보 제공 목적' 1줄.
 - 전체 길이는 텔레그램 2~4개 메시지 이내(약 6,000자 이내).
@@ -683,6 +758,20 @@ def build_kr_brief_with_claude(data):
 def _line(r):
     d20 = f" (20d {r['ret_20d']:+.2f}%)" if r.get("ret_20d") is not None else ""
     return f"<b>{r['name']}</b> {r['chg_pct_d']:+.2f}%{d20}"
+
+
+def _cap(eok):
+    return f"{eok / 10000:,.1f}조" if eok >= 10000 else f"{eok:,}억"
+
+
+def _sector_lines(L, movers_title, movers, reps):
+    L.append(f"   ▸ {movers_title}")
+    for r in movers:
+        L.append(f"   · {_line(r)}")
+    if reps:
+        L.append("   ▸ 대표 종목(시총 상위)")
+        for r in reps:
+            L.append(f"   · {_line(r)}  <i>시총 {_cap(r['market_cap_eok'])}</i>")
 
 
 def _pct(v):
@@ -769,6 +858,8 @@ def build_kr_fallback_brief(data, reason=None, failed=True):
             L.append(f"<i>사유: {reason}</i>")
     else:
         L = ["📊 <b>수치 요약본</b> <i>(해설 생성을 끄도록 설정되어 있습니다)</i>"]
+    if data.get("price_basis_warning"):
+        L.append(f"⚠️ <i>{data['price_basis_warning']}</i>")
     L += ["", f"🇰🇷 <b>한국 증시 마감 브리핑 — {data['session_date']}</b>", ""]
 
     narr = build_kr_narrative(data)
@@ -805,16 +896,15 @@ def build_kr_fallback_brief(data, reason=None, failed=True):
     for i, s in enumerate(data.get("strongest_sectors") or [], 1):
         L.append(f"<b>④-{i} 강세 업종: {s['sector']}</b> {s['chg_pct_d']:+.2f}% "
                  f"(상승 {s['up']}/하락 {s['down']}, 전체 {s['members']})")
-        for r in s["top3_by_daily_change"]:
-            L.append(f"   · {_line(r)}")
+        _sector_lines(L, "변동 상위", s["top3_by_daily_change"], s.get("top3_by_market_cap"))
         L.append("")
 
     w = data.get("weakest_sector")
     if w:
         L.append(f"<b>⑤ 약세 업종: {w['sector']}</b> {w['chg_pct_d']:+.2f}% "
                  f"(상승 {w['up']}/하락 {w['down']}, 전체 {w['members']})")
-        for r in w["bottom3_by_daily_change"]:
-            L.append(f"   · {_line(r)}")
+        _sector_lines(L, "변동 상위(하락)", w["bottom3_by_daily_change"],
+                      w.get("top3_by_market_cap"))
         L.append("")
 
     f = data.get("investor_flows") or {}
@@ -888,8 +978,8 @@ def main():
 
     session = datetime.strptime(data["session_date"], "%Y-%m-%d").date()
 
-    # 17:30 KST 실행이므로 정상 거래일이면 최근 세션은 'KST 기준 오늘'이어야 한다.
-    # 백업 크론(19:00 KST)이 늦어 KST 자정을 넘긴 실행은 '직전 영업일' 도 정상으로
+    # 20:30 KST 실행이므로 정상 거래일이면 최근 세션은 'KST 기준 오늘'이어야 한다.
+    # 백업 크론(21:30 KST)이 늦어 KST 자정을 넘긴 실행은 '직전 영업일' 도 정상으로
     # 받는다 - 판정 근거는 main.session_is_current 주석 참조.
     if not session_is_current(session, now_kst):
         if os.environ.get("FORCE_SEND") == "1":
