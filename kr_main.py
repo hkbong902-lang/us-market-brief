@@ -27,6 +27,7 @@
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 
 import requests
@@ -276,6 +277,18 @@ def check_krx_close_basis(session_date):
 FLOW_POOL_N = int(os.environ.get("KR_FLOW_POOL_N", "100"))   # 시장별 시총 상위 N
 FLOW_RANK_N = int(os.environ.get("KR_FLOW_RANK_N", "5"))
 FOREIGN_RANK_URL = "https://stock.naver.com/api/domestic/market/trend/trendForeignOrg"
+# ★ 기관 당일 순위는 외국인보다 늦게 올라온다 (2026-10-28 확인).
+#   20:32 KST 에 FOREIGNER 는 당일(20261028)인데 ORGANIZATION 은 여전히 전일(20261027),
+#   21:12 재조회에서는 당일이었다. 10/27 도 같았다. 10/25 에 이 경로로 옮길 때는 일요일에
+#   검증해 '그 시각에 당일치가 있는가'가 시험되지 않았다.
+#   그래서 순위 기준일이 세션과 다르면 RANK_POLL_SEC 간격으로 다시 묻고, RANK_WAIT_UNTIL
+#   (KST)이 지나면 기다림을 멈추고 기준일 라벨을 붙여 낸다. 기다림은 RANK_WAIT_FROM 이후
+#   시작한 당일 세션 실행에만 건다 - 낮의 수동 테스트가 밤까지 잠들지 않게 한다.
+#   ★ 상한은 백업 크론(21:30 KST)보다 넉넉히 앞이어야 한다. 정시 실행이 아직 끝나지 않은
+#     시각에 크론이 발화하면 중복 발송 가드가 볼 성공 실행이 없다.
+RANK_WAIT_FROM = os.environ.get("KR_RANK_WAIT_FROM", "20:00")
+RANK_WAIT_UNTIL = os.environ.get("KR_RANK_WAIT_UNTIL", "21:15")
+RANK_POLL_SEC = int(os.environ.get("KR_RANK_POLL_SEC", "180"))
 
 
 def naver_market_flow(market):
@@ -398,20 +411,49 @@ def collect_kr_flows(session_date):
             warn.append(f"{label} 수급 집계일({t['bizdate']})이 세션({want})과 다르다")
 
     # 외국인·기관 - 전 종목 당일 순위. 두 시장을 합쳐 금액순으로 다시 세운다.
-    ranks, rank_dates = {}, {}
-    for inv, label in (("FOREIGNER", "외국인"), ("ORGANIZATION", "기관")):
-        rb, rs = [], []
+    def fetch_rank(inv, label):
+        rb, rs, errs = [], [], []
         for market in ("KOSPI", "KOSDAQ"):
             try:
                 b, s = naver_investor_rank(market, inv)
                 rb += b
                 rs += s
             except Exception as e:
-                warn.append(f"{market} {label} 순위 수집 실패: {e}")
+                errs.append(f"{market} {label} 순위 수집 실패: {e}")
+        ds = {r["bizdate"] for r in rb + rs if r.get("bizdate")}
+        return rb, rs, errs, ds
+
+    def hhmm(s):
+        h, m = s.split(":")
+        return datetime.now(KST).replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+
+    ranks, rank_dates = {}, {}
+    for inv, label in (("FOREIGNER", "외국인"), ("ORGANIZATION", "기관")):
+        rb, rs, errs, ds = fetch_rank(inv, label)
+        now = datetime.now(KST)
+        if (want == now.strftime("%Y%m%d") and hhmm(RANK_WAIT_FROM) <= now
+                and ds != {want}):
+            deadline, tries = hhmm(RANK_WAIT_UNTIL), 1
+            while ds != {want} and datetime.now(KST) + timedelta(seconds=RANK_POLL_SEC) <= deadline:
+                print(f"FLOW-WAIT {label} 순위 기준일 {sorted(ds)} ≠ 세션 {want} → "
+                      f"{RANK_POLL_SEC}초 뒤 재조회 (상한 {RANK_WAIT_UNTIL} KST)", file=sys.stderr)
+                time.sleep(RANK_POLL_SEC)
+                rb, rs, errs, ds = fetch_rank(inv, label)
+                tries += 1
+            print(f"FLOW-WAIT {label} 순위 {tries}회 조회 후 기준일 {sorted(ds)} "
+                  f"(KST {datetime.now(KST):%H:%M})", file=sys.stderr)
+        warn += errs
+        # 두 시장의 기준일이 갈리면(코스피만 당일 등) 한 날짜로 통일한다. 섞어서 금액순으로
+        # 세우면 서로 다른 날의 순위가 한 목록에 들어간다.
+        if len(ds) > 1:
+            keep = max(ds)
+            warn.append(f"{label} 순위의 시장별 기준일이 갈려({sorted(ds)}) {keep} 행만 남겼다")
+            rb = [r for r in rb if r.get("bizdate") == keep]
+            rs = [r for r in rs if r.get("bizdate") == keep]
+            ds = {keep}
         rb.sort(key=lambda r: -r["net_eok"])
         rs.sort(key=lambda r: r["net_eok"])
         ranks[inv] = (rb, rs)
-        ds = {r["bizdate"] for r in rb + rs if r.get("bizdate")}
         rank_dates[inv] = max(ds) if ds else None
         if rank_dates[inv] and rank_dates[inv] != want:
             warn.append(f"{label} 순위 집계일({rank_dates[inv]})이 세션({want})과 다르다")

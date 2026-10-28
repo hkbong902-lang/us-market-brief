@@ -118,7 +118,9 @@ jobs:
 
       - name: Build & send KR brief
         if: steps.guard.outputs.skip != 'true'
-        timeout-minutes: 30
+        # 생성 상한 30분 + 기관 당일 순위 대기(kr_main RANK_WAIT_UNTIL, 20:30 → 최대 21:15)
+        # 45분. 대기를 덮지 못하면 당일치를 기다리다 브리핑이 통째로 누락된다 (2026-10-28).
+        timeout-minutes: 75
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
