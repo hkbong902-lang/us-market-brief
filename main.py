@@ -21,6 +21,7 @@ US Market Daily Brief -> Telegram
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -673,6 +674,7 @@ SYSTEM_PROMPT = """당신은 한국 은행 자금부의 시니어 마켓 데스�
 규칙:
 - 반드시 한국어. 텔레그램 발송용이므로 마크다운 표 대신 줄단위 텍스트/이모지 사용.
 - HTML 태그는 <b>, <i>만 사용 가능(텔레그램 HTML 모드). 다른 태그 금지.
+  마크다운(**굵게**, # 제목, - 목록 기호 대신 *)은 텔레그램에서 별표·샵이 그대로 보이므로 쓰지 말 것.
 - 개별 종목은 <b>회사명(티커)</b> 뒤에 등락률·추세 수치만 표기한다. 종목의 주가(종가·달러 금액)는
   브리핑 어디에도 쓰지 말 것. 지수·금리·유가·달러인덱스·VIX의 수치는 ②에 그대로 표기한다.
 - 수치 표기 약속(줄이 길어지지 않게 이 축약형을 쓸 것):
@@ -1131,6 +1133,22 @@ def build_fallback_brief(data, reason=None, failed=True):
 # 텔레그램 HTML 모드에서 속성 없이 쓸 수 있는 태그만 허용한다.
 ALLOWED_HTML_TAGS = ("b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre")
 
+# ★ 모델이 HTML 대신 마크다운을 섞는 날이 있다 (2026-11-18 KR 정시 발송).
+#   프롬프트는 <b>/<i> 만 쓰라고 하지만 같은 프롬프트·같은 데이터 구조에서 한 실행은
+#   **굵게** 를, 다른 실행은 <b> 를 냈다. 텔레그램 HTML 모드는 마크다운을 해석하지 않아
+#   별표가 그대로 보였다. 프롬프트로는 막을 수 없는 흔들림이라 발송 직전에 정규화한다.
+_MD_BOLD = re.compile(r"\*\*([^\n*]+?)\*\*")
+_MD_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", re.M)
+
+
+def markdown_to_telegram_html(text):
+    """**굵게** → <b>, '## 제목' 줄 → <b>제목</b>. 바꾼 개수를 로그에 남긴다."""
+    out, nb = _MD_BOLD.subn(r"<b>\1</b>", text)
+    out, nh = _MD_HEADING.subn(r"<b>\1</b>", out)
+    if nb or nh:
+        print(f"FORMAT-FIX 마크다운을 HTML 로 바꿨다: 굵게 {nb}곳, 제목 {nh}줄", file=sys.stderr)
+    return out
+
 
 def escape_telegram_html(text):
     """허용 태그만 남기고 나머지 <, >, & 를 이스케이프한다.
@@ -1138,6 +1156,7 @@ def escape_telegram_html(text):
     Claude가 생성한 본문에 부등호나 & 가 섞이면 텔레그램이 400을 돌려주고
     평문으로 재발송되면서 태그가 그대로 노출된다. 미리 막아 둔다.
     """
+    text = markdown_to_telegram_html(text)
     out = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     for tag in ALLOWED_HTML_TAGS:
         out = out.replace(f"&lt;{tag}&gt;", f"<{tag}>").replace(f"&lt;/{tag}&gt;", f"</{tag}>")
@@ -1183,6 +1202,9 @@ def send_telegram(text):
             "parse_mode": "HTML", "disable_web_page_preview": True,
         }, timeout=60)
         if not r.ok:  # HTML 파싱 오류 등 → 평문 재시도
+            # 평문으로 가면 태그가 그대로 보인다. 그 사실이 로그에 남아야 형식 문제를 추적할 수 있다.
+            print(f"FORMAT-WARN 텔레그램 HTML 거부({r.status_code}: {r.text[:200]}) → 평문 재발송",
+                  file=sys.stderr)
             r = requests.post(url, data={
                 "chat_id": chat_id, "text": chunk,
                 "disable_web_page_preview": True,
