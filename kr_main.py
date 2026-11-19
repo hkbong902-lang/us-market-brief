@@ -277,6 +277,12 @@ def check_krx_close_basis(session_date):
 FLOW_POOL_N = int(os.environ.get("KR_FLOW_POOL_N", "100"))   # 시장별 시총 상위 N
 FLOW_RANK_N = int(os.environ.get("KR_FLOW_RANK_N", "5"))
 FOREIGN_RANK_URL = "https://stock.naver.com/api/domestic/market/trend/trendForeignOrg"
+# ★ 이 요청만 데스크톱 UA 를 쓴다 (2026-11-19).
+#   네이버가 모바일 UA 의 stock.naver.com 요청을 m.stock.naver.com 으로 307 리다이렉트하기
+#   시작했고, m. 쪽에는 이 경로가 없어 404 다. 11/18 두 실행 모두 외국인·기관 순위가 이 404 로
+#   통째로 빠졌다. 다른 호출(NAVER_API)은 처음부터 m. 도메인이라 UA 를 바꾸지 않아도 된다.
+RANK_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 # ★ 기관 당일 순위는 외국인보다 늦게 올라온다 (2026-10-28 확인).
 #   20:32 KST 에 FOREIGNER 는 당일(20261028)인데 ORGANIZATION 은 여전히 전일(20261027),
 #   21:12 재조회에서는 당일이었다. 10/27 도 같았다. 10/25 에 이 경로로 옮길 때는 일요일에
@@ -317,9 +323,15 @@ def naver_investor_rank(market, investor="FOREIGNER"):
     r = requests.get(FOREIGN_RANK_URL,
                      params={"marketType": market, "investorType": investor,
                              "tradeType": "KRX"},
-                     headers={"User-Agent": UA["User-Agent"],
+                     headers={"User-Agent": RANK_UA,
                               "Accept": "application/json",
-                              "Referer": "https://stock.naver.com/"}, timeout=20)
+                              "Referer": "https://stock.naver.com/"}, timeout=20,
+                     allow_redirects=False)
+    # ★ 리다이렉트를 따라가지 않는다. 따라가면 다른 도메인의 404 가 원인처럼 보인다 -
+    #   11/18 로그는 'm.stock... 404' 였고 실제 원인(307)은 어디에도 남지 않았다.
+    if r.is_redirect:
+        raise RuntimeError(f"{r.status_code} 리다이렉트 → {r.headers.get('Location')} "
+                           f"(UA·도메인 정책 변경 의심)")
     r.raise_for_status()
     sec = (r.json() or {}).get("sections") or {}
 
@@ -431,10 +443,13 @@ def collect_kr_flows(session_date):
     for inv, label in (("FOREIGNER", "외국인"), ("ORGANIZATION", "기관")):
         rb, rs, errs, ds = fetch_rank(inv, label)
         now = datetime.now(KST)
+        # ★ 수집 자체가 실패했으면(errs) 기다리지 않는다 (2026-11-19). 기다림은 '당일치가
+        #   아직 안 올라왔다'를 위한 것이다. 11/18 에는 404 를 기준일 [] 로 읽고 40분을 재조회했다.
         if (want == now.strftime("%Y%m%d") and hhmm(RANK_WAIT_FROM) <= now
-                and ds != {want}):
+                and ds != {want} and not errs):
             deadline, tries = hhmm(RANK_WAIT_UNTIL), 1
-            while ds != {want} and datetime.now(KST) + timedelta(seconds=RANK_POLL_SEC) <= deadline:
+            while (ds != {want} and not errs
+                   and datetime.now(KST) + timedelta(seconds=RANK_POLL_SEC) <= deadline):
                 print(f"FLOW-WAIT {label} 순위 기준일 {sorted(ds)} ≠ 세션 {want} → "
                       f"{RANK_POLL_SEC}초 뒤 재조회 (상한 {RANK_WAIT_UNTIL} KST)", file=sys.stderr)
                 time.sleep(RANK_POLL_SEC)

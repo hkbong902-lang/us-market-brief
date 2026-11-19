@@ -66,14 +66,23 @@ jobs:
           #   전날 같은 시각(-24h)은 덮지 않는 폭이다.
           #   ★ 상한도 닫는다. 실시간에는 차이가 없지만, 과거 시점을 재현해 점검할 때
           #     열린 상한은 그 이후의 실행까지 세어 재현을 무의미하게 만든다.
-          since=$(date -u -d '12 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          #   ★ 2026-11-19: '최근 12시간' → '가장 최근 15:30 KST(06:30Z) 이후' 로 바꿨다.
+          #     크론 실측 발화가 19:38Z~22:38Z(예약 12:30Z 대비 7~10시간 지연)이고, 정시
+          #     dispatch 는 08:35Z(로컬 작업 17:35) 에 생성된다 - 간격이 12시간을 넘어
+          #     11/05~11/18 에 크론이 매일 중복 발송했다. 장 마감 시각에 묶으면 크론 지연·
+          #     dispatch 시각과 무관하게 '이 세션의 브리핑'을 센다. 전날 크론(최악 07:38 KST)은
+          #     15:30 앞이라 섞이지 않는다.
+          now_s=$(date -u +%s)
+          anchor=$(date -u -d "$(date -u +%F) 06:30:00" +%s)
+          [ "$now_s" -lt "$anchor" ] && anchor=$((anchor - 86400))
+          since=$(date -u -d "@$anchor" +%Y-%m-%dT%H:%M:%SZ)
           until=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           runs=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/kr_brief.yml/runs?per_page=20&status=success&created=${since}..${until}")
           # 자기 자신은 아직 success 가 아니므로 집계에 잡히지 않는다.
           count=$(printf '%s' "$runs" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workflow_runs",[])))')
-          echo "최근 12시간(UTC $since ~ $until) 성공한 실행: ${count}건"
+          echo "최근 장 마감 이후(UTC $since ~ $until) 성공한 실행: ${count}건"
           if [ "$count" -gt 0 ]; then
             echo "정시 경로가 이미 브리핑을 보냈습니다 → 백업 크론 실행을 건너뜁니다."
             echo "skip=true" >> "$GITHUB_OUTPUT"
